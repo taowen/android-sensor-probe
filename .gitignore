@@ -29,10 +29,12 @@ keystore.properties
 *.ap_
 captures/
 
+# Local reverse-engineering artifacts and experiment notes
+experiments/
+
 # OS / editor files
 .DS_Store
 Thumbs.db
 *.swp
 *.swo
 *~
-

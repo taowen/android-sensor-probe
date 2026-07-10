@@ -10,6 +10,8 @@ import android.os.Build
 import java.io.Closeable
 import java.util.concurrent.atomic.AtomicBoolean
 import android.graphics.Bitmap
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
 class UsbGlassesReader(private val context: Context, private val listener: Listener) : Closeable {
     enum class DisplayMode { MIRROR_2D, FULL_SBS_3D, HALF_SBS, HIGH_REFRESH, HIGH_REFRESH_SBS }
@@ -23,7 +25,9 @@ class UsbGlassesReader(private val context: Context, private val listener: Liste
     private val manager = context.getSystemService(UsbManager::class.java)
     private var session: MultiSession? = null
     private var slamReader:Ov580SlamReader?=null
+    private var helenTcpReader:XrealOneTcpReader?=null
     private var activeConnection:UsbDeviceConnection?=null
+    private var activeLibusbHandle:Long=0
     private var activeDevice:UsbDevice?=null
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context, i: Intent) {
@@ -47,18 +51,30 @@ class UsbGlassesReader(private val context: Context, private val listener: Liste
     }
     private fun open(device: UsbDevice) {
         val connection=manager.openDevice(device) ?: return listener.onStatus("无法打开 USB 设备")
-        activeConnection=connection;activeDevice=device
+        val nativeHandle=LibusbNative.open(connection.fileDescriptor)
+        if(nativeHandle==0L){connection.close();return listener.onStatus("libusb_wrap_sys_device 失败")}
+        activeConnection=connection;activeLibusbHandle=nativeHandle;activeDevice=device
         val model=ModelCatalog.identify(device)
+        if(model.xreal!=null && !model.xreal.bootloader && model.xreal.imuInterface==null) {
+            helenTcpReader=XrealOneTcpReader(listener::onReading) { listener.onStatus(it) }.also { it.start() }
+            listener.onStatus("正在连接 ${model.displayName} 的 USB Ethernet IMU；MCU interface ${model.xreal.mcuInterface}")
+            return
+        }
         if(device.vendorId==0x05a9 && device.productId==0x0680) {
             slamReader=Ov580SlamReader(connection.fileDescriptor,listener::onSlamFrame)
             listener.onStatus(if(slamReader?.started==true)"OV580 双 SLAM 相机已启动" else "OV580 SLAM JNI启动失败")
         }
-        val protocol=when(model.protocol){ GlassesModel.Protocol.XREAL_AIR->if(device.productId==0x0440) XbxA01Protocol else XrealProtocol; GlassesModel.Protocol.XREAL_LIGHT_MCU->XrealLightMcuProtocol; GlassesModel.Protocol.XREAL_LIGHT_OV580->XrealLightOv580Protocol; GlassesModel.Protocol.ROKID->RokidProtocol; GlassesModel.Protocol.GRAWOOW_MCU,GlassesModel.Protocol.MAD_GAZE->RawUsbProtocol; GlassesModel.Protocol.GRAWOOW_OV580->GrawoowOv580Protocol; GlassesModel.Protocol.VITURE->VitureProtocol; GlassesModel.Protocol.RAYNEO->RayneoProtocol; else->null }
-        if(protocol == null){ connection.close(); return listener.onStatus("已识别接口，但该型号尚无已验证的传感器协议") }
+        val protocol=when(model.protocol){ GlassesModel.Protocol.XREAL_AIR->if(model.xreal?.driverFamily?.startsWith("Helen")==true) XbxA01Protocol else XrealProtocol; GlassesModel.Protocol.XREAL_LIGHT_MCU->XrealLightMcuProtocol; GlassesModel.Protocol.XREAL_LIGHT_OV580->XrealLightOv580Protocol; GlassesModel.Protocol.ROKID->RokidProtocol; GlassesModel.Protocol.GRAWOOW_MCU,GlassesModel.Protocol.MAD_GAZE->RawUsbProtocol; GlassesModel.Protocol.GRAWOOW_OV580->GrawoowOv580Protocol; GlassesModel.Protocol.VITURE->VitureProtocol; GlassesModel.Protocol.RAYNEO->RayneoProtocol; else->null }
+        if(protocol == null){ LibusbNative.close(nativeHandle);connection.close(); return listener.onStatus("已识别接口，但该型号尚无已验证的传感器协议") }
+        val nativeHelenInit=protocol===XbxA01Protocol
+        if(nativeHelenInit) listener.onReading(SensorReading(LibusbNative.initializeXrealHelen(nativeHandle)))
         val allInterfaces=(0 until device.interfaceCount).map { device.getInterface(it) }
         val allHid=allInterfaces.filter { it.interfaceClass == UsbConstants.USB_CLASS_HID }
-        val candidates=if(device.productId==0x0440) allHid.filter { intf ->
-            (0 until intf.endpointCount).map { intf.getEndpoint(it) }.any { it.address==0x84 }
+        val candidates=if(model.protocol==GlassesModel.Protocol.XREAL_AIR) {
+            val official=model.xreal?.imuInterface
+            val byOfficial=official?.let { id->allHid.filter { it.id==id } }.orEmpty()
+            val byEndpoint=allHid.filter { intf->(0 until intf.endpointCount).any { intf.getEndpoint(it).address==0x84 } }
+            byOfficial.ifEmpty { byEndpoint.ifEmpty { allHid } }
         } else when(model.protocol) {
             GlassesModel.Protocol.ROKID -> allInterfaces.filter { i -> (0 until i.endpointCount).any { i.getEndpoint(it).address==0x82 || i.getEndpoint(it).address==0x83 } }
             GlassesModel.Protocol.GRAWOOW_OV580 -> allInterfaces.filter { i -> (0 until i.endpointCount).any { i.getEndpoint(it).address==0x89 } }
@@ -69,65 +85,117 @@ class UsbGlassesReader(private val context: Context, private val listener: Liste
         val sessions=mutableListOf<Session>()
         for(intf in candidates) {
             val input=(0 until intf.endpointCount).map{intf.getEndpoint(it)}.firstOrNull { it.direction == UsbConstants.USB_DIR_IN }
-            if(input == null || !connection.claimInterface(intf, true)) continue
+            if(input == null || (!nativeHelenInit && LibusbNative.claim(nativeHandle,intf.id)!=0)) continue
             val output=(0 until intf.endpointCount).map{intf.getEndpoint(it)}.firstOrNull { it.direction == UsbConstants.USB_DIR_OUT }
-            // XREAL IMU is identified by its stable interrupt endpoints (IN 0x84,
-            // OUT 0x05). xbx a01 renumbered interfaces but retained these endpoints.
-            val isXrealImu = input.address == 0x84 && output?.address == 0x05
-            val passive = device.productId == 0x0440 && !isXrealImu
-            sessions += Session(connection,intf,input,output,protocol,listener, passiveOnly = passive)
+            sessions += Session(nativeHandle,intf,input,output,protocol,listener, passiveOnly = nativeHelenInit)
         }
-        if(sessions.isEmpty()){ connection.close(); listener.onStatus("未找到可读取的 HID IN 接口"); return }
-        session=MultiSession(connection,sessions).also { it.start() }
+        if(sessions.isEmpty()){ LibusbNative.close(nativeHandle);connection.close(); listener.onStatus("未找到可读取的 HID IN 接口"); return }
+        session=MultiSession(nativeHandle,connection,sessions).also { it.start() }
         listener.onStatus("正在监听 ${model.displayName} · HID interfaces ${sessions.joinToString { it.intf.id.toString() }}")
     }
-    fun stop(){ slamReader?.close();slamReader=null;session?.close(); session=null;activeConnection=null;activeDevice=null }
+    fun stop(){
+        helenTcpReader?.close();helenTcpReader=null;slamReader?.close();slamReader=null
+        val managedBySession=session!=null;session?.close();session=null
+        if(!managedBySession){if(activeLibusbHandle!=0L)LibusbNative.close(activeLibusbHandle);activeConnection?.close()}
+        activeConnection=null;activeLibusbHandle=0;activeDevice=null
+    }
     fun setDisplayMode(mode:DisplayMode) {
-        val c=activeConnection?:return listener.onStatus("请先连接眼镜")
+        val h=activeLibusbHandle.takeIf{it!=0L}?:return listener.onStatus("请先连接眼镜")
         val d=activeDevice?:return
         val model=ModelCatalog.identify(d)
         val ok=when(model.protocol) {
-            GlassesModel.Protocol.XREAL_AIR -> if(d.productId==0x0440) false else sendXrealMcu(c,d,mode)
-            GlassesModel.Protocol.XREAL_LIGHT_MCU -> sendLightMcu(c,d,mode)
-            GlassesModel.Protocol.ROKID -> sendRokid(c,mode)
-            GlassesModel.Protocol.GRAWOOW_MCU -> sendGrawoow(c,mode)
-            GlassesModel.Protocol.MAD_GAZE -> sendMadGaze(c,d,mode)
+            GlassesModel.Protocol.XREAL_AIR -> if(model.xreal?.bootloader==true) false else sendXrealMcu(h,d,mode,model.xreal)
+            GlassesModel.Protocol.XREAL_LIGHT_MCU -> sendLightMcu(h,d,mode)
+            GlassesModel.Protocol.ROKID -> sendRokid(h,mode)
+            GlassesModel.Protocol.GRAWOOW_MCU -> sendGrawoow(h,mode)
+            GlassesModel.Protocol.MAD_GAZE -> sendMadGaze(h,d,mode)
             else -> false
         }
         listener.onStatus(if(ok)"${model.displayName}：${mode.name} 命令已发送" else "${model.displayName}：该模式未实现或发送失败")
     }
-    private fun sendXrealMcu(c:UsbDeviceConnection,d:UsbDevice,mode:DisplayMode):Boolean {
-        val value=when(mode){DisplayMode.MIRROR_2D->1;DisplayMode.FULL_SBS_3D->3;DisplayMode.HALF_SBS->8;DisplayMode.HIGH_REFRESH->11;DisplayMode.HIGH_REFRESH_SBS->9}
-        val p=ByteArray(64);p[0]=0xfd.toByte();p[5]=18;p[7]=0x37;p[8]=0x13;p[15]=8;p[22]=value.toByte()
-        val crc=java.util.zip.Adler32().apply{update(p,5,18)}.value;p[1]=crc.toByte();p[2]=(crc shr 8).toByte();p[3]=(crc shr 16).toByte();p[4]=(crc shr 24).toByte()
+    fun queryXrealDisplayMode() {
+        val d=activeDevice?:return
+        val model=ModelCatalog.identify(d)
+        val profile=model.xreal?:return listener.onStatus("当前设备不是已收录的 XREAL USB 眼镜")
+        val intf=(0 until d.interfaceCount).map { d.getInterface(it) }.firstOrNull { it.id==profile.mcuInterface }
+            ?:return listener.onStatus("${model.displayName} 没有可用的 MCU 接口")
+        val output=(0 until intf.endpointCount).map { intf.getEndpoint(it) }.firstOrNull { it.direction==UsbConstants.USB_DIR_OUT }
+            ?:return listener.onStatus("MCU OUT endpoint 不存在")
+        val input=(0 until intf.endpointCount).map { intf.getEndpoint(it) }.firstOrNull { it.direction==UsbConstants.USB_DIR_IN }
+            ?:return listener.onStatus("MCU IN endpoint 不存在")
+        Thread({
+            val c=manager.openDevice(d)?:return@Thread listener.onStatus("无法为 MCU 查询打开独立 USB connection")
+            val h=LibusbNative.open(c.fileDescriptor)
+            if(h==0L||LibusbNative.claim(h,intf.id)!=0) return@Thread listener.onStatus("无法 claim MCU interface ${intf.id}")
+            val requestId=0x1337
+            val command=xrealSdkPacket(0x07,byteArrayOf(),requestId)
+            if(nativeTransfer(h,output,command,command.size,500)!=command.size) return@Thread listener.onStatus("XREAL MCU 显示模式查询发送失败")
+            val response=ByteArray(maxOf(64,input.maxPacketSize))
+            var n=-1
+            for(attempt in 0 until 10) {
+                val received=nativeTransfer(h,input,response,response.size,300)
+                if(received>=17 && response[0]==0xfd.toByte()) {
+                    val responseId=ByteBuffer.wrap(response,7,4).order(ByteOrder.LITTLE_ENDIAN).int
+                    val responseCommand=(response[15].toInt() and 255) or ((response[16].toInt() and 255) shl 8)
+                    if(responseId==requestId && responseCommand==0x07) { n=received; break }
+                }
+            }
+            if(n<23) return@Thread listener.onStatus("XREAL MCU 查询未收到匹配的 0x07 响应")
+            val cmd=(response[15].toInt() and 255) or ((response[16].toInt() and 255) shl 8)
+            val status=response[22].toInt() and 255
+            val value=if(n>=27) ByteBuffer.wrap(response,23,4).order(ByteOrder.LITTLE_ENDIAN).int else null
+            listener.onReading(SensorReading("${model.displayName} MCU · cmd=${cmd.hex4()} · status=$status · displayRaw=${value ?: "无"}",rawHex=response.hex(n)))
+            LibusbNative.release(h,intf.id);LibusbNative.close(h);c.close()
+        },"xreal-mcu-query").start()
+    }
+    private fun sendXrealMcu(h:Long,d:UsbDevice,mode:DisplayMode,profile:XrealUsbProfile?):Boolean {
+        val value=when(mode){DisplayMode.MIRROR_2D->1;DisplayMode.HALF_SBS->2;DisplayMode.FULL_SBS_3D->3;DisplayMode.HIGH_REFRESH_SBS->4;DisplayMode.HIGH_REFRESH->return false}
+        val p=xrealSdkPacket(0x08,byteArrayOf(value.toByte()),0x1337)
         val endpoints=(0 until d.interfaceCount).flatMap{i->val f=d.getInterface(i);(0 until f.endpointCount).map{f to f.getEndpoint(it)}}
-        val out=endpoints.firstOrNull{it.second.direction==UsbConstants.USB_DIR_OUT&&it.second.address==0x07}
-            ?:endpoints.firstOrNull{it.second.direction==UsbConstants.USB_DIR_OUT&&it.second.address==0x05}?:return false
-        c.claimInterface(out.first,true);return c.bulkTransfer(out.second,p,p.size,500)==p.size
+        val out=endpoints.firstOrNull{it.first.id==profile?.mcuInterface&&it.second.direction==UsbConstants.USB_DIR_OUT}
+            ?:endpoints.firstOrNull{it.second.direction==UsbConstants.USB_DIR_OUT}?:return false
+        LibusbNative.claim(h,out.first.id);return nativeTransfer(h,out.second,p,p.size,500)==p.size
     }
-    private fun sendLightMcu(c:UsbDeviceConnection,d:UsbDevice,mode:DisplayMode):Boolean {
+    private fun xrealSdkPacket(command:Int,data:ByteArray,requestId:Int):ByteArray {
+        val bodyLength=17+data.size
+        return ByteArray(bodyLength+5).also { p ->
+            p[0]=0xfd.toByte();p[5]=bodyLength.toByte();p[6]=(bodyLength shr 8).toByte()
+            p[7]=requestId.toByte();p[8]=(requestId shr 8).toByte();p[9]=(requestId shr 16).toByte();p[10]=(requestId shr 24).toByte()
+            p[15]=command.toByte();p[16]=(command shr 8).toByte();data.copyInto(p,22)
+            val crc=java.util.zip.CRC32().apply{update(p,5,bodyLength)}.value
+            p[1]=crc.toByte();p[2]=(crc shr 8).toByte();p[3]=(crc shr 16).toByte();p[4]=(crc shr 24).toByte()
+        }
+    }
+    private fun sendLightMcu(h:Long,d:UsbDevice,mode:DisplayMode):Boolean {
         val v=when(mode){DisplayMode.MIRROR_2D->'1';DisplayMode.HALF_SBS->'2';DisplayMode.FULL_SBS_3D->'3';DisplayMode.HIGH_REFRESH_SBS->'4';DisplayMode.HIGH_REFRESH->return false}
-        val p=XrealLightMcuProtocol.displayMode(v);return sendAnyOut(c,d,p)
+        val p=XrealLightMcuProtocol.displayMode(v);return sendAnyOut(h,d,p)
     }
-    private fun sendRokid(c:UsbDeviceConnection,mode:DisplayMode):Boolean {val v=when(mode){DisplayMode.MIRROR_2D->0;DisplayMode.FULL_SBS_3D->1;DisplayMode.HIGH_REFRESH->3;DisplayMode.HIGH_REFRESH_SBS->4;DisplayMode.HALF_SBS->return false};val b=byteArrayOf(0);return c.controlTransfer(0x40,1,v,1,b,1,500)>=0}
-    private fun sendGrawoow(c:UsbDeviceConnection,mode:DisplayMode):Boolean {val v=when(mode){DisplayMode.MIRROR_2D->0;DisplayMode.FULL_SBS_3D->1;else->return false};val p=byteArrayOf(0xaa.toByte(),0xbb.toByte(),0x80.toByte(),8,0,1,v.toByte(),(0x80+8+1+v).toByte());return c.controlTransfer(0x21,9,0x201,0,p,p.size,1000)>=0}
-    private fun sendMadGaze(c:UsbDeviceConnection,d:UsbDevice,mode:DisplayMode):Boolean {val v=when(mode){DisplayMode.MIRROR_2D->0;DisplayMode.FULL_SBS_3D->1;else->return false};val cmd=byteArrayOf(':'.code.toByte(),'S'.code.toByte(),'3'.code.toByte(),'D'.code.toByte(),6,0xab.toByte(),0xcd.toByte(),v.toByte(),0,0,0xff.toByte());return sendAnyOut(c,d,cmd)}
-    private fun sendAnyOut(c:UsbDeviceConnection,d:UsbDevice,p:ByteArray):Boolean {for(i in 0 until d.interfaceCount){val f=d.getInterface(i);for(j in 0 until f.endpointCount){val e=f.getEndpoint(j);if(e.direction==UsbConstants.USB_DIR_OUT){c.claimInterface(f,true);if(c.bulkTransfer(e,p,p.size,500)>=0)return true}}};return false}
+    private fun sendRokid(h:Long,mode:DisplayMode):Boolean {val v=when(mode){DisplayMode.MIRROR_2D->0;DisplayMode.FULL_SBS_3D->1;DisplayMode.HIGH_REFRESH->3;DisplayMode.HIGH_REFRESH_SBS->4;DisplayMode.HALF_SBS->return false};val b=byteArrayOf(0);return LibusbNative.controlTransfer(h,0x40,1,v,1,b,1,500)>=0}
+    private fun sendGrawoow(h:Long,mode:DisplayMode):Boolean {val v=when(mode){DisplayMode.MIRROR_2D->0;DisplayMode.FULL_SBS_3D->1;else->return false};val p=byteArrayOf(0xaa.toByte(),0xbb.toByte(),0x80.toByte(),8,0,1,v.toByte(),(0x80+8+1+v).toByte());return LibusbNative.controlTransfer(h,0x21,9,0x201,0,p,p.size,1000)>=0}
+    private fun sendMadGaze(h:Long,d:UsbDevice,mode:DisplayMode):Boolean {val v=when(mode){DisplayMode.MIRROR_2D->0;DisplayMode.FULL_SBS_3D->1;else->return false};val cmd=byteArrayOf(':'.code.toByte(),'S'.code.toByte(),'3'.code.toByte(),'D'.code.toByte(),6,0xab.toByte(),0xcd.toByte(),v.toByte(),0,0,0xff.toByte());return sendAnyOut(h,d,cmd)}
+    private fun sendAnyOut(h:Long,d:UsbDevice,p:ByteArray):Boolean {for(i in 0 until d.interfaceCount){val f=d.getInterface(i);for(j in 0 until f.endpointCount){val e=f.getEndpoint(j);if(e.direction==UsbConstants.USB_DIR_OUT){LibusbNative.claim(h,f.id);if(nativeTransfer(h,e,p,p.size,500)>=0)return true}}};return false}
+    private fun nativeTransfer(h:Long,e:UsbEndpoint,p:ByteArray,length:Int,timeout:Int)=if(e.type==UsbConstants.USB_ENDPOINT_XFER_INT)LibusbNative.interruptTransfer(h,e.address,p,length,timeout)else LibusbNative.bulkTransfer(h,e.address,p,length,timeout)
     override fun close(){ stop(); context.unregisterReceiver(receiver) }
 
     @Suppress("DEPRECATION") private fun Intent.usbDevice(): UsbDevice? = if(Build.VERSION.SDK_INT >= 33) getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java) else getParcelableExtra(UsbManager.EXTRA_DEVICE)
 
-    private class MultiSession(private val connection: UsbDeviceConnection, private val sessions: List<Session>): Closeable {
+    private class MultiSession(private val nativeHandle:Long,private val connection: UsbDeviceConnection, private val sessions: List<Session>): Closeable {
         fun start()=sessions.forEach { it.start() }
-        override fun close(){ sessions.forEach { it.stop() }; connection.close() }
+        override fun close(){ sessions.forEach { it.stop() };LibusbNative.close(nativeHandle);connection.close() }
     }
-    private class Session(val connection: UsbDeviceConnection, val intf: UsbInterface, val input: UsbEndpoint, val output: UsbEndpoint?, val protocol: GlassesProtocol, val listener: Listener, val passiveOnly:Boolean): Closeable {
+    private class Session(val nativeHandle:Long, val intf: UsbInterface, val input: UsbEndpoint, val output: UsbEndpoint?, val protocol: GlassesProtocol, val listener: Listener, val passiveOnly:Boolean): Closeable {
         private val running=AtomicBoolean(true)
         private val thread=Thread({ run() }, "glasses-usb-reader")
-        fun start(){ thread.start() }
+        fun start(){
+            if(!(protocol===XbxA01Protocol&&passiveOnly)) {
+                val rc=LibusbNative.startEndpointReader(nativeHandle,input.address,input.type,maxOf(64,input.maxPacketSize))
+                if(rc!=0)listener.onStatus("interface ${intf.id} 原生异步 reader 启动失败：$rc")
+            }
+            thread.start()
+        }
         private fun run(){
             if(!passiveOnly) protocol.startCommand()?.let { cmd ->
-                val sent=output?.let { connection.bulkTransfer(it,cmd,cmd.size,500) } ?: connection.controlTransfer(0x21,0x09,0x0200,intf.id,cmd,cmd.size,500)
+                val sent=output?.let { transfer(it,cmd,cmd.size,500) } ?: LibusbNative.controlTransfer(nativeHandle,0x21,0x09,0x0200,intf.id,cmd,cmd.size,500)
                 if(sent < 0) listener.onStatus("启动 IMU 命令发送失败；继续监听被动报告")
             }
             if(protocol===XrealLightMcuProtocol) {
@@ -137,7 +205,7 @@ class UsbGlassesReader(private val context: Context, private val listener: Liste
             val data=ByteArray(maxOf(64,input.maxPacketSize))
             var misses=0; var packets=0
             while(running.get()){
-                val n=connection.bulkTransfer(input,data,data.size,500)
+                val n=readInput(data)
                 if(n > 0){
                     misses=0; packets++
                     val decoded=protocol.decode(data,n)
@@ -147,11 +215,18 @@ class UsbGlassesReader(private val context: Context, private val listener: Liste
                 else if(++misses == 6) listener.onStatus("interface ${intf.id} 暂无 HID 报告；请摇动眼镜或按眼镜按键")
             }
         }
-        private fun sendOut(cmd:ByteArray) {
-            output?.let { connection.bulkTransfer(it,cmd,cmd.size,500) }
-                ?: connection.controlTransfer(0x21,0x09,0x0200,intf.id,cmd,cmd.size,500)
+        private fun readInput(target:ByteArray):Int {
+            return if(protocol===XbxA01Protocol && passiveOnly) LibusbNative.readXrealHelen(nativeHandle,target,750)
+            else LibusbNative.readEndpoint(nativeHandle,input.address,target,750)
         }
-        fun stop(){ running.set(false); connection.releaseInterface(intf); thread.interrupt() }
+        private fun transfer(endpoint:UsbEndpoint,data:ByteArray,length:Int,timeout:Int)=
+            if(endpoint.type==UsbConstants.USB_ENDPOINT_XFER_INT)LibusbNative.interruptTransfer(nativeHandle,endpoint.address,data,length,timeout)
+            else LibusbNative.bulkTransfer(nativeHandle,endpoint.address,data,length,timeout)
+        private fun sendOut(cmd:ByteArray) {
+            output?.let { transfer(it,cmd,cmd.size,500) }
+                ?: LibusbNative.controlTransfer(nativeHandle,0x21,0x09,0x0200,intf.id,cmd,cmd.size,500)
+        }
+        fun stop(){ running.set(false);thread.interrupt();if(Thread.currentThread()!==thread)thread.join(1200) }
         override fun close()=stop()
     }
 }

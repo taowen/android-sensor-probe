@@ -3,6 +3,7 @@
     <uses-feature android:name="android.hardware.usb.host" android:required="true" />
     <uses-feature android:name="android.hardware.camera.external" android:required="false" />
     <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.INTERNET" />
     <application android:theme="@style/Theme.SensorProbe" android:label="AR 眼镜传感器探针" android:allowBackup="false">
         <activity android:name=".MainActivity" android:exported="true">
             <intent-filter>

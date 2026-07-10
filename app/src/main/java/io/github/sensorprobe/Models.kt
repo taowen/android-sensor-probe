@@ -2,17 +2,34 @@ package io.github.sensorprobe
 
 import android.hardware.usb.UsbDevice
 
-data class GlassesModel(val brand: String, val model: String, val protocol: Protocol, val capabilities:String="USB 接口探测") {
+data class XrealUsbProfile(
+    val officialTypeCode:Int,
+    val driverFamily:String,
+    val bootloader:Boolean,
+    val imuInterface:Int?,
+    val mcuInterface:Int?
+)
+
+data class GlassesModel(val brand: String, val model: String, val protocol: Protocol, val capabilities:String="USB 接口探测",val xreal:XrealUsbProfile?=null) {
     enum class Protocol { XREAL_AIR, XREAL_LIGHT_MCU, XREAL_LIGHT_OV580, ROKID, GRAWOOW_MCU, GRAWOOW_OV580, MAD_GAZE, VITURE, RAYNEO, GENERIC }
     val displayName get() = "$brand $model"
 }
 
 object ModelCatalog {
+    private data class XrealEntry(val name:String,val type:Int,val family:String,val boot:Boolean,val imu:Int?,val mcu:Int?)
+    // Extracted from the official Beam Pro 2.1.0 driver tables. Odd PIDs are
+    // bootloader identities; even PIDs are the normal application identities.
     private val xreal = mapOf(
-        0x0424 to "Air", 0x0428 to "Air 2", 0x0432 to "Air 2 Pro",
-        0x0426 to "Air 2 Ultra", 0x0435 to "One Pro", 0x0436 to "One Pro",
-        0x0437 to "One", 0x0438 to "One", 0x043e to "One S", 0x043d to "One S",
-        0x0440 to "xbx a01"
+        0x0423 to XrealEntry("Air Bootloader",2,"Air",true,null,null), 0x0424 to XrealEntry("Air",2,"Air",false,3,4),
+        0x0425 to XrealEntry("Air 2 Ultra Bootloader",5,"Flora",true,null,null), 0x0426 to XrealEntry("Air 2 Ultra",5,"Flora",false,1,0),
+        0x0427 to XrealEntry("Air 2 Bootloader",4,"P55",true,null,null), 0x0428 to XrealEntry("Air 2",4,"P55",false,3,4),
+        0x0431 to XrealEntry("Air 2 Pro Bootloader",3,"P55E",true,null,null), 0x0432 to XrealEntry("Air 2 Pro",3,"P55E",false,3,4),
+        0x0435 to XrealEntry("One Pro Bootloader",6,"Gina",true,null,null), 0x0436 to XrealEntry("One Pro",6,"Gina",false,null,0),
+        0x0437 to XrealEntry("One Bootloader",7,"GF",true,null,null), 0x0438 to XrealEntry("One",7,"GF",false,null,0),
+        0x0439 to XrealEntry("Hylla Bootloader",8,"Hylla",true,null,null), 0x043a to XrealEntry("Hylla",8,"Hylla",false,1,0),
+        0x043d to XrealEntry("One S Bootloader",9,"GS",true,null,null), 0x043e to XrealEntry("One S",9,"GS",false,null,0),
+        0x043f to XrealEntry("XBX A01 Bootloader",10,"Helen",true,null,null), 0x0440 to XrealEntry("XBX A01",10,"Helen",false,1,0),
+        0x0441 to XrealEntry("XBX A01 Plus Bootloader",11,"Helen Pro",true,null,null), 0x0442 to XrealEntry("XBX A01 Plus",11,"Helen Pro",false,1,0)
     )
     private val viture = mapOf(
         0x1011 to "One", 0x1013 to "One", 0x1017 to "One",
@@ -22,7 +39,11 @@ object ModelCatalog {
     )
 
     fun identify(d: UsbDevice): GlassesModel = when (d.vendorId) {
-        0x3318 -> GlassesModel("XREAL", xreal[d.productId] ?: "未知型号 (PID ${d.productId.hex4()})", GlassesModel.Protocol.XREAL_AIR, "IMU · 磁力计 · 按键 · 显示模式")
+        0x3318 -> xreal[d.productId]?.let { e ->
+            val profile=XrealUsbProfile(e.type,e.family,e.boot,e.imu,e.mcu)
+            GlassesModel("XREAL",e.name,if(e.boot)GlassesModel.Protocol.GENERIC else GlassesModel.Protocol.XREAL_AIR,
+                if(e.boot)"官方 ${e.family} Bootloader · 仅识别/固件模式" else "官方 type ${e.type} / ${e.family} · IMU · VSync · MCU 事件 · 显示模式",profile)
+        } ?: GlassesModel("XREAL",d.productName?:"未知型号 (PID ${d.productId.hex4()})",GlassesModel.Protocol.GENERIC,"官方 APK 未收录的 0x3318 设备")
         0x0486 -> if(d.productId==0x573c) GlassesModel("XREAL", "Light MCU", GlassesModel.Protocol.XREAL_LIGHT_MCU,"按键 · 接近 · 环境光 · VSync · 显示模式") else GlassesModel("USB",d.productName?:"未知设备",GlassesModel.Protocol.GENERIC)
         0x05a9 -> when(d.productId){
             0x0680 -> GlassesModel("XREAL","Light OV580",GlassesModel.Protocol.XREAL_LIGHT_OV580,"IMU · RGB相机 · 双SLAM相机")

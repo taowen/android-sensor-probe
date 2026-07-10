@@ -33,7 +33,8 @@ class MainActivity : AppCompatActivity(), UsbGlassesReader.Listener {
         root.addView(label("Type-C / USB 设备",19f)); devicesBox=LinearLayout(this).apply{orientation=LinearLayout.VERTICAL}; root.addView(devicesBox)
         val refresh=Button(this).apply { text="重新扫描"; setOnClickListener { reader.scan(); enumerateCameras() } }; root.addView(refresh)
         root.addView(label("MCU / 显示模式",19f))
-        root.addView(label("会直接向已连接眼镜发送模式命令；仅已实现的型号会执行。XBX a01 暂不写入未公开的私有命令。",13f))
+        root.addView(label("会直接向已连接眼镜发送模式命令；仅已实现并匹配型号的命令会执行。",13f))
+        root.addView(Button(this).apply { text="读取 XREAL MCU 显示模式（只读）"; setOnClickListener { reader.queryXrealDisplayMode() } })
         val modeBox=LinearLayout(this).apply { orientation=LinearLayout.VERTICAL }
         listOf(
             "2D 镜像" to UsbGlassesReader.DisplayMode.MIRROR_2D,

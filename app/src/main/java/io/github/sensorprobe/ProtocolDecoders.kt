@@ -49,7 +49,7 @@ object XrealProtocol : GlassesProtocol {
         val packetLength=3+data.size
         val body = byteArrayOf(packetLength.toByte(), (packetLength shr 8).toByte(), msgId.toByte()) + data
         val crc = CRC32().apply { update(body) }.value
-        return ByteArray(64).also { out ->
+        return ByteArray(body.size+5).also { out ->
             out[0]=0xAA.toByte(); out[1]=crc.toByte(); out[2]=(crc shr 8).toByte(); out[3]=(crc shr 16).toByte(); out[4]=(crc shr 24).toByte()
             body.copyInto(out,5)
         }
@@ -70,6 +70,10 @@ object XrealProtocol : GlassesProtocol {
 object XbxA01Protocol : GlassesProtocol {
     override fun startCommand() = XrealProtocol.startCommand(1)
     override fun decode(bytes: ByteArray, length: Int):SensorReading? {
+        if(length>=9 && bytes[0]==0xaa.toByte() && (bytes[7].toInt() and 255)==0x19) {
+            val status=bytes[8].toInt() and 255
+            return SensorReading("XBX A01 / Helen · IMU 启动 ACK · ${if(status==0) "成功" else "错误 $status"}",rawHex=bytes.hex(length))
+        }
         if(length!=64 || bytes[0].toInt()!=1 || bytes[1].toInt()!=2) return null
         fun u16(o:Int)=(bytes[o].toInt() and 255) or ((bytes[o+1].toInt() and 255) shl 8)
         fun i16(o:Int)=u16(o).toShort().toInt()
