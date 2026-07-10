@@ -80,7 +80,7 @@ class UsbGlassesReader(private val context: Context, private val listener: Liste
             slamReader=Ov580SlamReader(connection.fileDescriptor,listener::onSlamFrame)
             listener.onStatus(if(slamReader?.started==true)"OV580 双 SLAM 相机已启动" else "OV580 SLAM JNI启动失败")
         }
-        val protocol=when(model.protocol){ GlassesModel.Protocol.XREAL_AIR->if(model.xreal?.driverFamily?.startsWith("Helen")==true) XbxA01Protocol else XrealProtocol; GlassesModel.Protocol.XREAL_LIGHT_MCU->XrealLightMcuProtocol; GlassesModel.Protocol.XREAL_LIGHT_OV580->XrealLightOv580Protocol; GlassesModel.Protocol.ROKID->RokidProtocol; GlassesModel.Protocol.GRAWOOW_MCU,GlassesModel.Protocol.MAD_GAZE,GlassesModel.Protocol.VITURE_PASSIVE->RawUsbProtocol; GlassesModel.Protocol.GRAWOOW_OV580->GrawoowOv580Protocol; GlassesModel.Protocol.VITURE->VitureProtocol; GlassesModel.Protocol.RAYNEO->RayneoProtocol; else->null }
+        val protocol=when(model.protocol){ GlassesModel.Protocol.XREAL_AIR->if(model.xreal?.driverFamily?.startsWith("Helen")==true) XbxA01Protocol else XrealProtocol; GlassesModel.Protocol.XREAL_LIGHT_MCU->XrealLightMcuProtocol; GlassesModel.Protocol.XREAL_LIGHT_OV580->XrealLightOv580Protocol; GlassesModel.Protocol.ROKID->RokidProtocol; GlassesModel.Protocol.GRAWOOW_MCU,GlassesModel.Protocol.MAD_GAZE->RawUsbProtocol; GlassesModel.Protocol.VITURE_PASSIVE->VitureGen2RawProtocol; GlassesModel.Protocol.GRAWOOW_OV580->GrawoowOv580Protocol; GlassesModel.Protocol.VITURE->VitureProtocol; GlassesModel.Protocol.RAYNEO->RayneoProtocol; else->null }
         if(protocol == null){ LibusbNative.close(nativeHandle);connection.close(); return listener.onStatus("已识别接口，但该型号尚无已验证的传感器协议") }
         val nativeHelenInit=protocol===XbxA01Protocol
         if(nativeHelenInit) listener.onReading(SensorReading(LibusbNative.initializeXrealHelen(nativeHandle)))
@@ -94,7 +94,7 @@ class UsbGlassesReader(private val context: Context, private val listener: Liste
         } else when(model.protocol) {
             GlassesModel.Protocol.ROKID -> allInterfaces.filter { i -> (0 until i.endpointCount).any { i.getEndpoint(it).address==0x82 || i.getEndpoint(it).address==0x83 } }
             GlassesModel.Protocol.GRAWOOW_OV580 -> allInterfaces.filter { i -> (0 until i.endpointCount).any { i.getEndpoint(it).address==0x89 } }
-            GlassesModel.Protocol.VITURE_PASSIVE -> allInterfaces.filter { i -> (0 until i.endpointCount).any { i.getEndpoint(it).direction==UsbConstants.USB_DIR_IN } }
+            GlassesModel.Protocol.VITURE_PASSIVE -> allHid
             GlassesModel.Protocol.XREAL_LIGHT_OV580 -> allInterfaces.filter { i -> i.id!=1 && (0 until i.endpointCount).any { i.getEndpoint(it).direction==UsbConstants.USB_DIR_IN } }
             GlassesModel.Protocol.XREAL_LIGHT_MCU,GlassesModel.Protocol.GRAWOOW_MCU,GlassesModel.Protocol.MAD_GAZE -> allInterfaces.filter { i -> (0 until i.endpointCount).any { i.getEndpoint(it).direction==UsbConstants.USB_DIR_IN } }
             else -> allHid
@@ -130,6 +130,17 @@ class UsbGlassesReader(private val context: Context, private val listener: Liste
             else -> false
         }
         listener.onStatus(if(ok)"${model.displayName}：${mode.name} 命令已发送" else "${model.displayName}：该模式未实现或发送失败")
+    }
+    fun queryVitureBeastMode(){
+        if(activeDevice?.let{it.vendorId==0x35ca&&(it.productId==0x1201||it.productId==0x1211)}!=true)return listener.onStatus("请先连接 VITURE Beast 主控")
+        val ok=session?.send(VitureGen2RawProtocol.command(0x3140))==true && session?.send(VitureGen2RawProtocol.command(0x3142))==true
+        listener.onStatus(if(ok)"已发送 Beast 模式查询，等待 MCU 响应" else "Beast 模式查询发送失败")
+    }
+    fun setVitureBeastDimension(is3d:Boolean){
+        if(activeDevice?.let{it.vendorId==0x35ca&&(it.productId==0x1201||it.productId==0x1211)}!=true)return listener.onStatus("请先连接 VITURE Beast 主控")
+        val value=if(is3d)0x37 else 0x31
+        val ok=session?.send(VitureGen2RawProtocol.command(0x0142,byteArrayOf(value.toByte())))==true
+        listener.onStatus(if(ok)"已发送 Beast ${if(is3d)"3D" else "2D"} 切换命令" else "Beast 显示模式命令发送失败")
     }
     fun queryXrealDisplayMode() {
         val d=activeDevice?:return
@@ -199,11 +210,14 @@ class UsbGlassesReader(private val context: Context, private val listener: Liste
 
     private class MultiSession(private val nativeHandle:Long,private val connection: UsbDeviceConnection, private val sessions: List<Session>): Closeable {
         fun start()=sessions.forEach { it.start() }
+        fun send(command:ByteArray)=sessions.firstOrNull{it.hasOutput}?.send(command)==command.size
         override fun close(){ sessions.forEach { it.stop() };LibusbNative.close(nativeHandle);connection.close() }
     }
     private class Session(val nativeHandle:Long, val intf: UsbInterface, val input: UsbEndpoint, val output: UsbEndpoint?, val protocol: GlassesProtocol, val listener: Listener, val passiveOnly:Boolean): Closeable {
         private val running=AtomicBoolean(true)
         private val thread=Thread({ run() }, "glasses-usb-reader")
+        val hasOutput get()=output!=null
+        @Synchronized fun send(command:ByteArray)=output?.let{transfer(it,command,command.size,500)}?:-1
         fun start(){
             if(!(protocol===XbxA01Protocol&&passiveOnly)) {
                 val rc=LibusbNative.startEndpointReader(nativeHandle,input.address,input.type,maxOf(64,input.maxPacketSize))

@@ -1,0 +1,11 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <receiver
+            android:name=".DebugCommandReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="io.github.sensorprobe.DEBUG_COMMAND" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

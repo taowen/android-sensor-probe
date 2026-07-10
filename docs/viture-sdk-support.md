@@ -16,4 +16,17 @@
 
 SDK 的普通设备 raw callback 返回 10 个 float。One/Lite/Pro 的磁力计三项固定为零；Luma、Luma Pro 和 Beast 返回陀螺仪、加速度计、磁力计和温度。Carina 回调另行提供六轴 IMU、VSync、pose 和四路灰度相机帧。
 
+Beast 的 Gen2 V2 协议由 Probe 直接实现，不依赖官方 `libglasses.so`。V2 包头为 `10 00`、little-endian message ID、payload 长度、16 位 payload 字节累加和；RAW IMU 使用 `0301 [02 02]`（120 Hz）。显示状态查询使用 `3140` 和 `3142`，2D/3D 设置使用 `0142 [31]` / `0142 [37]`。
+
+Debug APK 提供 ADB receiver。先启动应用，再发送：
+
+```bash
+adb shell am broadcast -a io.github.sensorprobe.DEBUG_COMMAND -p io.github.sensorprobe --es command connect_beast
+adb shell am broadcast -a io.github.sensorprobe.DEBUG_COMMAND -p io.github.sensorprobe --es command query_beast
+adb shell am broadcast -a io.github.sensorprobe.DEBUG_COMMAND -p io.github.sensorprobe --es command set_2d
+adb shell am broadcast -a io.github.sensorprobe.DEBUG_COMMAND -p io.github.sensorprobe --es command set_3d
+```
+
+该 receiver 仅打包进 Debug 变体；Release APK 不包含此入口。
+
 `1301` 被 SDK 的产品校验和商品名函数正式接受并命名为 Pro 2，但未出现在官方 demo 较旧的 USB filter 中；探针按 SDK 库本身的能力将其收录。

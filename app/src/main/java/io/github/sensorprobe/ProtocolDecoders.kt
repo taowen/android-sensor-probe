@@ -103,6 +103,48 @@ object VitureProtocol : GlassesProtocol {
     private fun crc16(d: ByteArray, from: Int, len: Int): Int { var crc=0xffff; for(i in from until from+len){ crc=crc xor ((d[i].toInt() and 255) shl 8); repeat(8){crc=if(crc and 0x8000 != 0) (crc shl 1) xor 0x1021 else crc shl 1; crc=crc and 0xffff} }; return crc }
 }
 
+/** VITURE Gen2 raw report used by Luma and Beast (HID interface 5 on Beast). */
+object VitureGen2RawProtocol : GlassesProtocol {
+    override fun startCommand()=command(0x0301,byteArrayOf(2,2))
+
+    fun command(messageId:Int,payload:ByteArray=byteArrayOf()):ByteArray {
+        val checksum=payload.sumOf{it.toInt() and 0xff} and 0xffff
+        return ByteBuffer.allocate(8+payload.size).order(ByteOrder.LITTLE_ENDIAN).apply {
+            putShort(0x10.toShort());putShort(messageId.toShort());putShort(payload.size.toShort());putShort(checksum.toShort());put(payload)
+        }.array()
+    }
+
+    override fun decode(bytes:ByteArray,length:Int):SensorReading? {
+        if(length<8 || bytes[0]!=0x10.toByte() || bytes[1]!=0.toByte())return null
+        val b=ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+        val messageId=b.getShort(2).toInt() and 0xffff
+        val payloadLength=b.getShort(4).toInt() and 0xffff
+        if(payloadLength>length-8)return null
+        val expected=b.getShort(6).toInt() and 0xffff
+        val actual=(8 until 8+payloadLength).sumOf{bytes[it].toInt() and 0xff} and 0xffff
+        if(expected!=actual)return null
+        if(messageId!=0x7309) {
+            val status=bytes.getOrNull(8)?.toInt()?.and(0xff)
+            val value=bytes.getOrNull(9)?.toInt()?.and(0xff)
+            val source=when(messageId) {
+                0x2301->"VITURE RAW IMU 启动 ACK · status=$status"
+                0x5140->"VITURE Beast 模式 · ${if(value==1)"Native" else if(value==0)"Bypass" else "未知 $value"}"
+                0x5142->"VITURE Beast 显示 · ${if(value==0x31)"2D" else if(value==0x37)"3D" else "mode=${value?.hex4()}"}"
+                0x2142->"VITURE Beast 显示模式设置 ACK · status=$status"
+                else->"VITURE V2 response ${messageId.hex4()} · status=$status value=$value"
+            }
+            return SensorReading(source,rawHex=bytes.hex(length))
+        }
+        if(length<64)return null
+        fun v3(offset:Int)=floatArrayOf(b.getFloat(offset),b.getFloat(offset+4),b.getFloat(offset+8))
+        val temperature=(b.getShort(16).toInt() and 0xffff)/5f
+        val timestamp=(b.getInt(60).toLong() and 0xffffffffL)*1000L
+        val gyro=v3(18);val accel=v3(30);val magnet=v3(42)
+        if((gyro+accel+magnet).any{!it.isFinite()})return null
+        return SensorReading("VITURE Gen2 RAW IMU (g, rad/s, µT)",timestamp,accel,gyro,magnet,temperature=temperature,rawHex=bytes.hex(length))
+    }
+}
+
 object RayneoProtocol : GlassesProtocol {
     override fun startCommand() = ByteArray(64).also { it[0]=0x66; it[1]=1 }
     override fun decode(bytes: ByteArray, length: Int): SensorReading? {
