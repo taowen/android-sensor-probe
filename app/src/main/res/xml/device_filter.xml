@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <usb-device vendor-id="13080" /> <!-- XREAL 0x3318 -->
+    <usb-device vendor-id="13770" /> <!-- VITURE 0x35ca -->
+    <usb-device vendor-id="7099" />  <!-- RayNeo 0x1bbb -->
+    <usb-device vendor-id="1234" />  <!-- Rokid 0x04d2 -->
+    <usb-device vendor-id="1158" />  <!-- XREAL Light MCU 0x0486 -->
+    <usb-device vendor-id="1449" />  <!-- OV580 0x05a9 -->
+    <usb-device vendor-id="8183" />  <!-- Grawoow 0x1ff7 -->
+    <usb-device vendor-id="1204" />  <!-- Mad Gaze serial 0x04b4 -->
+</resources>
