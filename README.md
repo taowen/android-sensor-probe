@@ -16,7 +16,7 @@
 - 对 XREAL Helen/XBX 执行官方 MCU 初始化序列和 IMU 校准读取/启动序列
 - 向公开协议支持的设备发送 2D、Full SBS、Half SBS 和高刷新率显示模式命令
 
-详细型号和能力矩阵见 [docs/ar-drivers-rs-support.md](docs/ar-drivers-rs-support.md)。
+详细型号和能力矩阵见 [ar-drivers-rs 支持表](docs/ar-drivers-rs-support.md)和 [VITURE 官方 SDK 支持表](docs/viture-sdk-support.md)。
 
 > [!WARNING]
 > 本项目处于实验阶段。显示模式命令会直接改变眼镜状态；只应在确认型号后使用。XBX A01 的 MCU 初始化和显示模式封包来自对官方 Beam Pro APK 的实机验证，但连续 IMU 数据仍依赖 APK 外动态注入的 `NRImuStartExt` 实现，尚未打通。

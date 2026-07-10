@@ -20,37 +20,53 @@ class UsbGlassesReader(private val context: Context, private val listener: Liste
         fun onStatus(message: String)
         fun onReading(reading: SensorReading)
         fun onSlamFrame(left:Bitmap,right:Bitmap,timestamp:Long)
+        fun onUvcFrame(frame:Bitmap)
     }
     companion object { private const val ACTION_PERMISSION = "io.github.sensorprobe.USB_PERMISSION" }
     private val manager = context.getSystemService(UsbManager::class.java)
     private var session: MultiSession? = null
     private var slamReader:Ov580SlamReader?=null
+    private var uvcReader:UvcCameraReader?=null
     private var helenTcpReader:XrealOneTcpReader?=null
     private var activeConnection:UsbDeviceConnection?=null
     private var activeLibusbHandle:Long=0
     private var activeDevice:UsbDevice?=null
+    private var pendingPermissionDevice:UsbDevice?=null
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context, i: Intent) {
             when (i.action) {
-                ACTION_PERMISSION -> i.usbDevice()?.let { if (manager.hasPermission(it)) open(it) else listener.onStatus("USB 权限被拒绝") }
+                ACTION_PERMISSION -> {
+                    val device=i.usbDevice() ?: pendingPermissionDevice
+                    pendingPermissionDevice=null
+                    if(device != null && manager.hasPermission(device)) open(device)
+                    else listener.onStatus("USB 权限被拒绝或授权结果无效")
+                }
                 UsbManager.ACTION_USB_DEVICE_ATTACHED, UsbManager.ACTION_USB_DEVICE_DETACHED -> { if(i.action == UsbManager.ACTION_USB_DEVICE_DETACHED) stop(); scan() }
             }
         }
     }
     init {
         val f=IntentFilter().apply { addAction(ACTION_PERMISSION); addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED); addAction(UsbManager.ACTION_USB_DEVICE_DETACHED) }
-        context.registerReceiver(receiver, f, if(Build.VERSION.SDK_INT >= 33) Context.RECEIVER_NOT_EXPORTED else 0)
+        context.registerReceiver(receiver, f, if(Build.VERSION.SDK_INT >= 33) Context.RECEIVER_EXPORTED else 0)
     }
     fun scan() { listener.onDevicesChanged(manager.deviceList.values.sortedBy { it.deviceName }) }
     fun connect(device: UsbDevice) {
         stop()
         if (!manager.hasPermission(device)) {
-            val pi=PendingIntent.getBroadcast(context, 0, Intent(ACTION_PERMISSION).setPackage(context.packageName), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+            pendingPermissionDevice=device
+            // UsbManager uses fill-in extras for the device and grant result.
+            val pi=PendingIntent.getBroadcast(context, 0, Intent(ACTION_PERMISSION).setPackage(context.packageName), PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
             manager.requestPermission(device, pi); listener.onStatus("等待 USB 授权…")
         } else open(device)
     }
     private fun open(device: UsbDevice) {
         val connection=manager.openDevice(device) ?: return listener.onStatus("无法打开 USB 设备")
+        if(device.vendorId==0x0c45 && (device.productId==0x6368 || device.productId==0x636b)) {
+            activeConnection=connection;activeDevice=device
+            uvcReader=UvcCameraReader(connection.fileDescriptor,listener::onUvcFrame)
+            listener.onStatus(if(uvcReader?.started==true)"${ModelCatalog.identify(device).displayName} · ${uvcReader?.transport} · 1920×1080@30 MJPEG 已启动" else "UVC/libusb 启动失败")
+            return
+        }
         val nativeHandle=LibusbNative.open(connection.fileDescriptor)
         if(nativeHandle==0L){connection.close();return listener.onStatus("libusb_wrap_sys_device 失败")}
         activeConnection=connection;activeLibusbHandle=nativeHandle;activeDevice=device
@@ -64,7 +80,7 @@ class UsbGlassesReader(private val context: Context, private val listener: Liste
             slamReader=Ov580SlamReader(connection.fileDescriptor,listener::onSlamFrame)
             listener.onStatus(if(slamReader?.started==true)"OV580 双 SLAM 相机已启动" else "OV580 SLAM JNI启动失败")
         }
-        val protocol=when(model.protocol){ GlassesModel.Protocol.XREAL_AIR->if(model.xreal?.driverFamily?.startsWith("Helen")==true) XbxA01Protocol else XrealProtocol; GlassesModel.Protocol.XREAL_LIGHT_MCU->XrealLightMcuProtocol; GlassesModel.Protocol.XREAL_LIGHT_OV580->XrealLightOv580Protocol; GlassesModel.Protocol.ROKID->RokidProtocol; GlassesModel.Protocol.GRAWOOW_MCU,GlassesModel.Protocol.MAD_GAZE->RawUsbProtocol; GlassesModel.Protocol.GRAWOOW_OV580->GrawoowOv580Protocol; GlassesModel.Protocol.VITURE->VitureProtocol; GlassesModel.Protocol.RAYNEO->RayneoProtocol; else->null }
+        val protocol=when(model.protocol){ GlassesModel.Protocol.XREAL_AIR->if(model.xreal?.driverFamily?.startsWith("Helen")==true) XbxA01Protocol else XrealProtocol; GlassesModel.Protocol.XREAL_LIGHT_MCU->XrealLightMcuProtocol; GlassesModel.Protocol.XREAL_LIGHT_OV580->XrealLightOv580Protocol; GlassesModel.Protocol.ROKID->RokidProtocol; GlassesModel.Protocol.GRAWOOW_MCU,GlassesModel.Protocol.MAD_GAZE,GlassesModel.Protocol.VITURE_PASSIVE->RawUsbProtocol; GlassesModel.Protocol.GRAWOOW_OV580->GrawoowOv580Protocol; GlassesModel.Protocol.VITURE->VitureProtocol; GlassesModel.Protocol.RAYNEO->RayneoProtocol; else->null }
         if(protocol == null){ LibusbNative.close(nativeHandle);connection.close(); return listener.onStatus("已识别接口，但该型号尚无已验证的传感器协议") }
         val nativeHelenInit=protocol===XbxA01Protocol
         if(nativeHelenInit) listener.onReading(SensorReading(LibusbNative.initializeXrealHelen(nativeHandle)))
@@ -78,6 +94,7 @@ class UsbGlassesReader(private val context: Context, private val listener: Liste
         } else when(model.protocol) {
             GlassesModel.Protocol.ROKID -> allInterfaces.filter { i -> (0 until i.endpointCount).any { i.getEndpoint(it).address==0x82 || i.getEndpoint(it).address==0x83 } }
             GlassesModel.Protocol.GRAWOOW_OV580 -> allInterfaces.filter { i -> (0 until i.endpointCount).any { i.getEndpoint(it).address==0x89 } }
+            GlassesModel.Protocol.VITURE_PASSIVE -> allInterfaces.filter { i -> (0 until i.endpointCount).any { i.getEndpoint(it).direction==UsbConstants.USB_DIR_IN } }
             GlassesModel.Protocol.XREAL_LIGHT_OV580 -> allInterfaces.filter { i -> i.id!=1 && (0 until i.endpointCount).any { i.getEndpoint(it).direction==UsbConstants.USB_DIR_IN } }
             GlassesModel.Protocol.XREAL_LIGHT_MCU,GlassesModel.Protocol.GRAWOOW_MCU,GlassesModel.Protocol.MAD_GAZE -> allInterfaces.filter { i -> (0 until i.endpointCount).any { i.getEndpoint(it).direction==UsbConstants.USB_DIR_IN } }
             else -> allHid
@@ -94,7 +111,8 @@ class UsbGlassesReader(private val context: Context, private val listener: Liste
         listener.onStatus("正在监听 ${model.displayName} · HID interfaces ${sessions.joinToString { it.intf.id.toString() }}")
     }
     fun stop(){
-        helenTcpReader?.close();helenTcpReader=null;slamReader?.close();slamReader=null
+        pendingPermissionDevice=null
+        helenTcpReader?.close();helenTcpReader=null;slamReader?.close();slamReader=null;uvcReader?.close();uvcReader=null
         val managedBySession=session!=null;session?.close();session=null
         if(!managedBySession){if(activeLibusbHandle!=0L)LibusbNative.close(activeLibusbHandle);activeConnection?.close()}
         activeConnection=null;activeLibusbHandle=0;activeDevice=null

@@ -19,6 +19,8 @@ class MainActivity : AppCompatActivity(), UsbGlassesReader.Listener {
     private lateinit var status: TextView
     private lateinit var cameras: TextView
     private lateinit var cameraPreviews: LinearLayout
+    private lateinit var uvcPreview:ImageView
+    private lateinit var slamSection:LinearLayout
     private lateinit var slamBox:LinearLayout
     private lateinit var slamLeft:ImageView
     private lateinit var slamRight:ImageView
@@ -30,6 +32,9 @@ class MainActivity : AppCompatActivity(), UsbGlassesReader.Listener {
         fun label(text:String,size:Float=16f)=TextView(this).apply { this.text=text; textSize=size; setTextColor(Color.WHITE); setPadding(0,12,0,12) }
         root.addView(label("AR 眼镜传感器探针",26f))
         status=label("正在扫描 USB…",14f).also(root::addView)
+        root.addView(label("眼镜/USB 外接摄像头（不含手机内置）",19f)); cameras=label("正在枚举…",14f).also(root::addView)
+        cameraPreviews=LinearLayout(this).apply{orientation=LinearLayout.VERTICAL};root.addView(cameraPreviews)
+        uvcPreview=ImageView(this).apply{adjustViewBounds=true;visibility=View.GONE};root.addView(uvcPreview)
         root.addView(label("Type-C / USB 设备",19f)); devicesBox=LinearLayout(this).apply{orientation=LinearLayout.VERTICAL}; root.addView(devicesBox)
         val refresh=Button(this).apply { text="重新扫描"; setOnClickListener { reader.scan(); enumerateCameras() } }; root.addView(refresh)
         root.addView(label("MCU / 显示模式",19f))
@@ -51,13 +56,12 @@ class MainActivity : AppCompatActivity(), UsbGlassesReader.Listener {
         }
         root.addView(modeBox)
         root.addView(label("实时读数",19f)); reading=label("连接支持的眼镜后显示 IMU 数据",15f).also(root::addView)
-        root.addView(label("眼镜/USB 外接摄像头（不含手机内置）",19f)); cameras=label("正在枚举…",14f).also(root::addView)
-        cameraPreviews=LinearLayout(this).apply{orientation=LinearLayout.VERTICAL};root.addView(cameraPreviews)
-        root.addView(label("原始 SLAM 相机（JNI/OV580）",19f))
-        slamStatus=label("未连接支持的 OV580设备",14f).also(root::addView)
+        slamSection=LinearLayout(this).apply{orientation=LinearLayout.VERTICAL;visibility=View.GONE}
+        slamSection.addView(label("原始 SLAM 相机（JNI/OV580）",19f))
+        slamStatus=label("OV580 已连接，等待打开眼镜设备",14f).also(slamSection::addView)
         slamBox=LinearLayout(this).apply{orientation=LinearLayout.HORIZONTAL}
         slamLeft=ImageView(this).apply{adjustViewBounds=true};slamRight=ImageView(this).apply{adjustViewBounds=true}
-        slamBox.addView(slamLeft,LinearLayout.LayoutParams(0,LinearLayout.LayoutParams.WRAP_CONTENT,1f));slamBox.addView(slamRight,LinearLayout.LayoutParams(0,LinearLayout.LayoutParams.WRAP_CONTENT,1f));root.addView(slamBox)
+        slamBox.addView(slamLeft,LinearLayout.LayoutParams(0,LinearLayout.LayoutParams.WRAP_CONTENT,1f));slamBox.addView(slamRight,LinearLayout.LayoutParams(0,LinearLayout.LayoutParams.WRAP_CONTENT,1f));slamSection.addView(slamBox);root.addView(slamSection)
         val scroll=ScrollView(this).apply { addView(root) }; setContentView(scroll)
         reader=UsbGlassesReader(this,this); reader.scan(); enumerateCameras()
     }
@@ -70,6 +74,8 @@ class MainActivity : AppCompatActivity(), UsbGlassesReader.Listener {
             val b=Button(this).apply { text="${m.displayName}  ${d.vendorId.hex4()}:${d.productId.hex4()}"; setOnClickListener { reader.connect(d) } }
             devicesBox.addView(b); devicesBox.addView(text("能力：${m.capabilities}\n${describe(d)}"))
         }
+        slamSection.visibility=if(devices.any{it.vendorId==0x05a9&&it.productId==0x0680})View.VISIBLE else View.GONE
+        enumerateCameras()
     }
     override fun onStatus(message:String)=runOnUiThread { status.text=message }
     override fun onReading(r:SensorReading)=runOnUiThread {
@@ -81,6 +87,7 @@ class MainActivity : AppCompatActivity(), UsbGlassesReader.Listener {
         }
     }
     override fun onSlamFrame(left:android.graphics.Bitmap,right:android.graphics.Bitmap,timestamp:Long)=runOnUiThread {slamLeft.setImageBitmap(left);slamRight.setImageBitmap(right);slamStatus.text="双目 SLAM 640×480 · timestamp $timestamp µs"}
+    override fun onUvcFrame(frame:android.graphics.Bitmap)=runOnUiThread {uvcPreview.visibility=View.VISIBLE;uvcPreview.setImageBitmap(frame)}
     private fun text(s:String)=TextView(this).apply { text=s; textSize=13f; setTextColor(Color.LTGRAY); setPadding(8,4,8,16) }
     private fun describe(d:UsbDevice)=buildString {
         append("${d.interfaceCount} 个接口")
@@ -97,11 +104,22 @@ class MainActivity : AppCompatActivity(), UsbGlassesReader.Listener {
             val c=cm.getCameraCharacteristics(id)
             c.get(CameraCharacteristics.LENS_FACING)==CameraCharacteristics.LENS_FACING_EXTERNAL
         }
-        cameras.text=externalIds.joinToString("\n") { id ->
+        val usbVideoDevices=getSystemService(UsbManager::class.java).deviceList.values.filter { d ->
+            (0 until d.interfaceCount).any { d.getInterface(it).interfaceClass==UsbConstants.USB_CLASS_VIDEO }
+        }
+        val camera2Lines=externalIds.map { id ->
             val c=cm.getCameraCharacteristics(id)
             val sizes=c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)?.getOutputSizes(android.graphics.ImageFormat.YUV_420_888)
             "Camera2 ID $id · USB/外接 · ${sizes?.joinToString { "${it.width}×${it.height}" } ?: "无 YUV 输出"}"
-        }.ifEmpty { "未发现 Camera2 外接摄像头。当前眼镜 USB 描述符也没有 UVC Video 接口。" }
+        }
+        val usbLines=usbVideoDevices.map { d ->
+            val model=ModelCatalog.identify(d)
+            val streaming=(0 until d.interfaceCount).flatMap { i -> val f=d.getInterface(i);(0 until f.endpointCount).map{f.getEndpoint(it)} }
+                .filter{it.type==UsbConstants.USB_ENDPOINT_XFER_ISOC&&it.direction==UsbConstants.USB_DIR_IN}
+            "USB UVC ${d.vendorId.hex4()}:${d.productId.hex4()} · ${model.displayName} · ${streaming.size} 个视频流 alternate setting"+
+                if(externalIds.isEmpty())"\n已检测到相机描述符，但手机 Camera2 HAL 未将它暴露为外接摄像头；需要原生 UVC 预览。" else ""
+        }
+        cameras.text=(usbLines+camera2Lines).joinToString("\n").ifEmpty { "未发现 USB Video Class 或 Camera2 外接摄像头。" }
         cameraPreviews.removeAllViews()
         externalIds.forEach { cameraPreviews.addView(ExternalCameraPreview(this,it)) }
     }

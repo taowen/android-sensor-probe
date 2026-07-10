@@ -11,12 +11,13 @@ data class XrealUsbProfile(
 )
 
 data class GlassesModel(val brand: String, val model: String, val protocol: Protocol, val capabilities:String="USB 接口探测",val xreal:XrealUsbProfile?=null) {
-    enum class Protocol { XREAL_AIR, XREAL_LIGHT_MCU, XREAL_LIGHT_OV580, ROKID, GRAWOOW_MCU, GRAWOOW_OV580, MAD_GAZE, VITURE, RAYNEO, GENERIC }
+    enum class Protocol { XREAL_AIR, XREAL_LIGHT_MCU, XREAL_LIGHT_OV580, ROKID, GRAWOOW_MCU, GRAWOOW_OV580, MAD_GAZE, VITURE, VITURE_PASSIVE, RAYNEO, GENERIC }
     val displayName get() = "$brand $model"
 }
 
 object ModelCatalog {
     private data class XrealEntry(val name:String,val type:Int,val family:String,val boot:Boolean,val imu:Int?,val mcu:Int?)
+    private data class VitureEntry(val name:String,val generation:String,val capabilities:String,val gen1Protocol:Boolean=false)
     // Extracted from the official Beam Pro 2.1.0 driver tables. Odd PIDs are
     // bootloader identities; even PIDs are the normal application identities.
     private val xreal = mapOf(
@@ -31,11 +32,29 @@ object ModelCatalog {
         0x043f to XrealEntry("XBX A01 Bootloader",10,"Helen",true,null,null), 0x0440 to XrealEntry("XBX A01",10,"Helen",false,1,0),
         0x0441 to XrealEntry("XBX A01 Plus Bootloader",11,"Helen Pro",true,null,null), 0x0442 to XrealEntry("XBX A01 Plus",11,"Helen Pro",false,1,0)
     )
+    // VITURE SDK 2.3.2: get_market_name()/is_product_id_valid() and the
+    // official Android demo USB filter. 0x1301 (Pro 2) is accepted by the
+    // library although it is missing from the demo's older filter XML.
     private val viture = mapOf(
-        0x1011 to "One", 0x1013 to "One", 0x1017 to "One",
-        0x1015 to "One Lite", 0x101b to "One Lite", 0x1019 to "Pro", 0x101d to "Pro",
-        0x1131 to "Luma", 0x1121 to "Luma Pro", 0x1141 to "Luma Pro",
-        0x1101 to "Luma Ultra", 0x1104 to "Luma Ultra", 0x1151 to "Luma Cyber", 0x1201 to "Beast"
+        0x1011 to VitureEntry("One","Gen1","3DoF pose · 原始陀螺仪/加速度计 · VSync · 设备控制",true),
+        0x1013 to VitureEntry("One","Gen1","3DoF pose · 原始陀螺仪/加速度计 · VSync · 设备控制",true),
+        0x1017 to VitureEntry("One","Gen1","3DoF pose · 原始陀螺仪/加速度计 · VSync · 设备控制",true),
+        0x1015 to VitureEntry("Lite","Gen1","3DoF pose · 原始陀螺仪/加速度计 · VSync · 设备控制",true),
+        0x101b to VitureEntry("Lite","Gen1","3DoF pose · 原始陀螺仪/加速度计 · VSync · 设备控制",true),
+        0x1019 to VitureEntry("Pro","Gen1","3DoF pose · 原始陀螺仪/加速度计 · VSync · 设备控制",true),
+        0x101d to VitureEntry("Pro","Gen1","3DoF pose · 原始陀螺仪/加速度计 · VSync · 设备控制",true),
+        0x1131 to VitureEntry("Luma","Gen2","3DoF pose · 9轴原始 IMU · VSync · 设备控制"),
+        0x1121 to VitureEntry("Luma Pro","Gen2","3DoF pose · 9轴原始 IMU · VSync · 双目相机 0C45:636B"),
+        0x1141 to VitureEntry("Luma Pro","Gen2","3DoF pose · 9轴原始 IMU · VSync · 双目相机 0C45:636B"),
+        0x1151 to VitureEntry("Luma Cyber","Gen2","3DoF pose · 9轴原始 IMU · VSync · 双目相机 0C45:636B"),
+        0x1101 to VitureEntry("Luma Ultra","Carina","原生 3DoF/6DoF · IMU · VSync · 四路灰度 SLAM · 双目相机 0C45:636B"),
+        // Beast enumerates this composite audio/HID companion separately from
+        // the 1201/1211 glasses controller and the 0C45:6368 UVC camera.
+        0x1102 to VitureEntry("Beast 伴生音频/HID","Gen2 Native DOF","USB 麦克风 · 三组 HID 端点 · Beast 设备控制/传感器伴生接口"),
+        0x1104 to VitureEntry("Luma Ultra","Carina","原生 3DoF/6DoF · IMU · VSync · 四路灰度 SLAM · 双目相机 0C45:636B"),
+        0x1201 to VitureEntry("Beast","Gen2 Native DOF","眼镜端原生 3DoF · 9轴 IMU · VSync · 单目相机 0C45:6368 · 设备控制"),
+        0x1211 to VitureEntry("Beast","Gen2 Native DOF","眼镜端原生 3DoF · 9轴 IMU · VSync · 单目相机 0C45:6368 · 设备控制"),
+        0x1301 to VitureEntry("Pro 2","Gen2","3DoF pose · 原始 IMU · VSync · 设备控制")
     )
 
     fun identify(d: UsbDevice): GlassesModel = when (d.vendorId) {
@@ -53,7 +72,13 @@ object ModelCatalog {
         0x04d2 -> if(d.productId==0x162f) GlassesModel("Rokid",if(d.productName?.contains("Max",true)==true)"Max" else "Air",GlassesModel.Protocol.ROKID,"IMU · 磁力计 · 按键 · 接近 · 显示模式") else GlassesModel("Rokid",d.productName?:"未知型号",GlassesModel.Protocol.GENERIC)
         0x1ff7 -> if(d.productId==0x0ff4) GlassesModel("Grawoow / MetaVision","G530 / M53 MCU",GlassesModel.Protocol.GRAWOOW_MCU,"序列号 · 显示模式 · 校准数据") else GlassesModel("USB",d.productName?:"未知设备",GlassesModel.Protocol.GENERIC)
         0x04b4 -> if(d.productId==0x0002) GlassesModel("Mad Gaze","Glow",GlassesModel.Protocol.MAD_GAZE,"USB串口 · IMU · 磁力计 · 显示模式") else GlassesModel("Cypress",d.productName?:"未知设备",GlassesModel.Protocol.GENERIC)
-        0x35ca -> GlassesModel("VITURE", viture[d.productId] ?: "未知型号 (PID ${d.productId.hex4()})", GlassesModel.Protocol.VITURE)
+        0x35ca -> viture[d.productId]?.let { e -> GlassesModel("VITURE",e.name,if(e.gen1Protocol)GlassesModel.Protocol.VITURE else GlassesModel.Protocol.VITURE_PASSIVE,"官方 SDK ${e.generation} · ${e.capabilities}") }
+            ?: GlassesModel("VITURE","未知型号 (PID ${d.productId.hex4()})",GlassesModel.Protocol.GENERIC,"VITURE SDK 2.3.2 未收录")
+        0x0c45 -> when(d.productId) {
+            0x636b -> GlassesModel("VITURE","Luma 系列双目相机",GlassesModel.Protocol.GENERIC,"UVC/USB 相机 · Luma Pro/Cyber/Ultra")
+            0x6368 -> GlassesModel("VITURE","Beast 单目相机",GlassesModel.Protocol.GENERIC,"UVC/USB 单目相机 · Beast")
+            else -> GlassesModel(d.manufacturerName?:"Sonix",d.productName?:"USB Camera",GlassesModel.Protocol.GENERIC)
+        }
         0x1bbb -> GlassesModel("RayNeo", if (d.productId == 0xaf50) "Air 3S Pro" else "未知型号 (PID ${d.productId.hex4()})", if (d.productId == 0xaf50) GlassesModel.Protocol.RAYNEO else GlassesModel.Protocol.GENERIC)
         else -> GlassesModel(d.manufacturerName ?: "USB", d.productName ?: "未知设备", GlassesModel.Protocol.GENERIC)
     }

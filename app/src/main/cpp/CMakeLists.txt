@@ -15,6 +15,6 @@ add_library(libusb_static STATIC
 target_include_directories(libusb_static PRIVATE ${LIBUSB_ROOT}/android ${LIBUSB_ROOT}/libusb ${LIBUSB_ROOT}/libusb/os)
 target_compile_definitions(libusb_static PRIVATE OS_LINUX=1)
 target_compile_options(libusb_static PRIVATE -pthread -fvisibility=hidden)
-add_library(sensorprobe_native SHARED ov580_jni.cpp libusb_jni.cpp)
+add_library(sensorprobe_native SHARED ov580_jni.cpp uvc_jni.cpp libusb_jni.cpp)
 target_include_directories(sensorprobe_native PRIVATE ${LIBUSB_ROOT}/libusb)
 target_link_libraries(sensorprobe_native libusb_static log)
