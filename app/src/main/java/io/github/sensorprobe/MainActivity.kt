@@ -91,6 +91,7 @@ class MainActivity : AppCompatActivity(), UsbGlassesReader.Listener {
     private fun handleDebugCommand(intent:Intent?){
         when(intent?.getStringExtra("command")){
             "connect_beast"->getSystemService(UsbManager::class.java).deviceList.values.firstOrNull{it.vendorId==0x35ca&&(it.productId==0x1201||it.productId==0x1211)}?.let(reader::connect)
+            "connect_viture"->getSystemService(UsbManager::class.java).deviceList.values.firstOrNull{ModelCatalog.identify(it).protocol in setOf(GlassesModel.Protocol.VITURE,GlassesModel.Protocol.VITURE_PASSIVE)}?.let(reader::connect)
             "query_beast"->reader.queryVitureBeastMode()
             "set_2d"->reader.setVitureBeastDimension(false)
             "set_3d"->reader.setVitureBeastDimension(true)

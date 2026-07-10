@@ -22,6 +22,7 @@ Debug APK 提供 ADB receiver。先启动应用，再发送：
 
 ```bash
 adb shell am broadcast -a io.github.sensorprobe.DEBUG_COMMAND -p io.github.sensorprobe --es command connect_beast
+adb shell am broadcast -a io.github.sensorprobe.DEBUG_COMMAND -p io.github.sensorprobe --es command connect_viture
 adb shell am broadcast -a io.github.sensorprobe.DEBUG_COMMAND -p io.github.sensorprobe --es command query_beast
 adb shell am broadcast -a io.github.sensorprobe.DEBUG_COMMAND -p io.github.sensorprobe --es command set_2d
 adb shell am broadcast -a io.github.sensorprobe.DEBUG_COMMAND -p io.github.sensorprobe --es command set_3d
@@ -30,3 +31,11 @@ adb shell am broadcast -a io.github.sensorprobe.DEBUG_COMMAND -p io.github.senso
 该 receiver 仅打包进 Debug 变体；Release APK 不包含此入口。
 
 `1301` 被 SDK 的产品校验和商品名函数正式接受并命名为 Pro 2，但未出现在官方 demo 较旧的 USB filter 中；探针按 SDK 库本身的能力将其收录。
+
+## Probe 支持状态
+
+- One、Lite、Pro：按 Gen1 协议启动并解析 3DoF pose；需要对应真机复核各固件的 RAW 模式。
+- Luma、Luma Pro、Luma Cyber、Pro 2：使用与官方 Gen2 一致的 `0301 [02 02]` RAW 启动和 `7309` 十通道报告解析；已由 Beast 验证协议实现，其他型号待真机复核。
+- Beast：RAW IMU、Native/Bypass 查询、2D/3D 查询与切换均已在真机验证。
+- Luma Ultra：单独识别为 Carina，不会误发 Gen2 命令；Carina pose/IMU/VSync/四路灰度流仍需真机完成协议验证。
+- Beast 的 `1102` 伴生音频/HID 设备只做接口探测，不会被误当作眼镜主控启动 IMU。

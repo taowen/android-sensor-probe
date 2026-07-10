@@ -103,7 +103,7 @@ object VitureProtocol : GlassesProtocol {
     private fun crc16(d: ByteArray, from: Int, len: Int): Int { var crc=0xffff; for(i in from until from+len){ crc=crc xor ((d[i].toInt() and 255) shl 8); repeat(8){crc=if(crc and 0x8000 != 0) (crc shl 1) xor 0x1021 else crc shl 1; crc=crc and 0xffff} }; return crc }
 }
 
-/** VITURE Gen2 raw report used by Luma and Beast (HID interface 5 on Beast). */
+/** VITURE Gen2 raw report used by Luma, Luma Pro/Cyber, Beast and Pro 2. */
 object VitureGen2RawProtocol : GlassesProtocol {
     override fun startCommand()=command(0x0301,byteArrayOf(2,2))
 
