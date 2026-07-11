@@ -16,3 +16,12 @@ Source: [badicsalex/ar-drivers-rs](https://github.com/badicsalex/ar-drivers-rs),
 | Mad Gaze Glow | `04b4:0002` | BMI160 accel + gyro, AK09911 magnetometer | none | experimental USB serial framing and 2D/stereo commands |
 
 The upstream display controls include mirrored 2D, full SBS, half SBS and high-refresh modes where supported. Sensor Probe exposes these as explicit UI actions and never changes display mode during passive probing. Implementations ported from upstream still require testing on each physical model.
+
+## XREAL scope boundary
+
+The XREAL entries above belong to the older Air/Light protocol families. They
+do not describe XBX A01 (Helen) initialization. Helen uses a separate MCU and
+IMU pipeline, requires the `0x31 / "3.1.1"` SDK handshake, calibration-blob
+loading, a persistent MCU heartbeat, and a single serially resubmitted IMU URB.
+See [XREAL USB protocol notes](xreal-usb-protocol.md). Sensor Probe routes Helen
+devices to a dedicated implementation instead of the `ar-drivers-rs` Air path.
