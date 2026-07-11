@@ -41,8 +41,6 @@ object XrealLightMcuProtocol:GlassesProtocol {
 }
 
 object XrealProtocol : GlassesProtocol {
-    private const val GYRO_SCALE = 2000f / 8388608f
-    private const val ACCEL_SCALE = 16f / 8388608f
     override fun startCommand() = startCommand(1.toByte())
     fun startCommand(state: Byte) = command(0x19, byteArrayOf(state))
     fun command(msgId: Int, data: ByteArray = byteArrayOf()): ByteArray {
@@ -55,15 +53,7 @@ object XrealProtocol : GlassesProtocol {
         }
     }
     override fun decode(bytes: ByteArray, length: Int): SensorReading? {
-        if (length != 64 || bytes[0].toInt() != 1) return null
-        fun i24(o: Int): Int { val n = (bytes[o].toInt() and 255) or ((bytes[o+1].toInt() and 255) shl 8) or ((bytes[o+2].toInt() and 255) shl 16); return if (n and 0x800000 != 0) n or -0x1000000 else n }
-        fun i16(o: Int) = ((bytes[o].toInt() and 255) or (bytes[o+1].toInt() shl 8)).toShort().toInt()
-        val timestamp = ByteBuffer.wrap(bytes, 4, 8).order(ByteOrder.LITTLE_ENDIAN).long
-        return SensorReading("XREAL HID IMU", timestamp,
-            floatArrayOf(i24(33)*ACCEL_SCALE, i24(36)*ACCEL_SCALE, i24(39)*ACCEL_SCALE),
-            floatArrayOf(i24(18)*GYRO_SCALE, i24(21)*GYRO_SCALE, i24(24)*GYRO_SCALE),
-            floatArrayOf(i16(48).toFloat(), i16(50).toFloat(), i16(52).toFloat()),
-            temperature = ByteBuffer.wrap(bytes, 2, 2).order(ByteOrder.LITTLE_ENDIAN).short.toFloat() / 132.48f + 25f, rawHex = bytes.hex(length))
+        return decodeXrealImu(bytes,length,"XREAL HID IMU")
     }
 }
 
@@ -74,23 +64,45 @@ object XbxA01Protocol : GlassesProtocol {
             val status=bytes[8].toInt() and 255
             return SensorReading("XBX A01 / Helen · IMU 启动 ACK · ${if(status==0) "成功" else "错误 $status"}",rawHex=bytes.hex(length))
         }
-        if(length!=64 || bytes[0].toInt()!=1 || bytes[1].toInt()!=2) return null
-        fun u16(o:Int)=(bytes[o].toInt() and 255) or ((bytes[o+1].toInt() and 255) shl 8)
-        fun i16(o:Int)=u16(o).toShort().toInt()
-        fun i24(o:Int):Int { val v=(bytes[o].toInt() and 255) or ((bytes[o+1].toInt() and 255) shl 8) or ((bytes[o+2].toInt() and 255) shl 16); return if(v and 0x800000!=0)v-0x1000000 else v }
-        fun i32(o:Int)=ByteBuffer.wrap(bytes,o,4).order(ByteOrder.LITTLE_ENDIAN).int
-        val gd=i32(0x0E); val ad=i32(0x1D); val md=i32(0x2C); val mo=i16(0x2A)
-        val gyroRaw=if(gd!=0) FloatArray(3){i24(0x12+it*3)*u16(0x0C).toFloat()/gd} else null
-        val accelRaw=if(ad!=0) FloatArray(3){i24(0x21+it*3)*u16(0x1B).toFloat()/ad} else null
-        val radians=(Math.PI/180.0).toFloat()
-        val gyro=gyroRaw?.let { floatArrayOf(-it[0]*radians,it[2]*radians,it[1]*radians) }
-        val accel=accelRaw?.let { floatArrayOf(-it[0]*9.81f,it[2]*9.81f,it[1]*9.81f) }
-        val magnet=if(md!=0) FloatArray(3){(i16(0x30+it*2)-mo).toFloat()/md} else null
-        val timestamp=ByteBuffer.wrap(bytes,4,8).order(ByteOrder.LITTLE_ENDIAN).long
-        return SensorReading("XBX A01 HID IMU",timestamp/1000,accel,gyro,magnet,
-            temperature=i16(2)/326.8f+25f,rawHex=bytes.hex(length),timestampUnit="µs",
-            accelUnit="m/s²",gyroUnit="rad/s",magnetUnit="raw")
+        return decodeXrealImu(bytes,length,"XBX A01 HID IMU")
     }
+}
+
+/** Flora/Hylla use the common AA control transport. The report decoder is
+ * selected from the version byte exactly as the official service does. */
+class XrealKernelImuProtocol(private val family:String) : GlassesProtocol {
+    override fun startCommand() = XrealProtocol.startCommand(1)
+    override fun decode(bytes:ByteArray,length:Int):SensorReading? =
+        decodeXrealImu(bytes,length,"XREAL $family kernel IMU")
+}
+
+private fun decodeXrealImu(bytes:ByteArray,length:Int,source:String):SensorReading? {
+    if(length!=64 || (bytes[0].toInt() and 255)!=1)return null
+    val version=bytes[1].toInt() and 255
+    if(version !in 1..2)return null
+    fun u16(o:Int)=(bytes[o].toInt() and 255) or ((bytes[o+1].toInt() and 255) shl 8)
+    fun i16(o:Int)=u16(o).toShort().toInt()
+    fun i24(o:Int):Int {val v=(bytes[o].toInt() and 255) or ((bytes[o+1].toInt() and 255) shl 8) or ((bytes[o+2].toInt() and 255) shl 16);return if(v and 0x800000!=0)v-0x1000000 else v}
+    fun i32(o:Int)=ByteBuffer.wrap(bytes,o,4).order(ByteOrder.LITTLE_ENDIAN).int
+    fun scaled3(offset:Int,stride:Int,numerator:Int,divisor:Int)=if(divisor!=0)FloatArray(3){i->
+        val raw=if(stride==2)i16(offset+i*stride) else i24(offset+i*stride)
+        raw*numerator.toFloat()/divisor
+    }else null
+    val gyroRaw:FloatArray?;val accelRaw:FloatArray?;val magnet:FloatArray?;val temperature:Float
+    if(version==1) {
+        gyroRaw=scaled3(18,2,u16(12),i32(14));accelRaw=scaled3(30,2,u16(24),i32(26))
+        val md=i32(38);val mo=i16(36);magnet=if(md!=0)FloatArray(3){(i16(42+it*2)-mo).toFloat()/md}else null
+        temperature=i16(2)*0.4831f+25f
+    } else {
+        gyroRaw=scaled3(18,3,u16(12),i32(14));accelRaw=scaled3(33,3,u16(27),i32(29))
+        val md=i32(44);val mo=i16(42);magnet=if(md!=0)FloatArray(3){(i16(48+it*2)-mo).toFloat()/md}else null
+        temperature=i16(2)*0.007548309f+25f
+    }
+    val radians=(Math.PI/180.0).toFloat()
+    val gyro=gyroRaw?.let{floatArrayOf(-it[0]*radians,it[2]*radians,it[1]*radians)}
+    val accel=accelRaw?.let{floatArrayOf(-it[0]*9.8f,it[2]*9.8f,it[1]*9.8f)}
+    return SensorReading("$source · report v$version",ByteBuffer.wrap(bytes,4,8).order(ByteOrder.LITTLE_ENDIAN).long,
+        accel,gyro,magnet,temperature=temperature,rawHex=bytes.hex(length),accelUnit="m/s²",gyroUnit="rad/s")
 }
 
 /** XBX/Helen FD-framed MCU responses and unsolicited hardware events. */

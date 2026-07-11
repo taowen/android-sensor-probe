@@ -19,18 +19,24 @@ XBX A01 暴露三个 HID interrupt interface：
 
 官方驱动表中已知的 `0x3318` application PID：
 
-| PID | 型号/代号 | IMU interface | MCU interface |
-|---:|---|---:|---:|
-| `0424` | Air / Air | 3 | 4 |
-| `0426` | Air 2 Ultra / Flora | 1 | 0 |
-| `0428` | Air 2 / P55 | 3 | 4 |
-| `0432` | Air 2 Pro / P55E | 3 | 4 |
-| `0436` | One Pro / Gina | — | 0 |
-| `0438` | One / GF | — | 0 |
-| `043a` | Hylla | 1 | 0 |
-| `043e` | One S / GS | — | 0 |
-| `0440` | XBX A01 / Helen | 1 | 0 |
-| `0442` | XBX A01 Plus / Helen Pro | 1 | 0 |
+| PID | 型号/代号 | official kernel/app type | IMU logical type | VSync type | 传输 |
+|---:|---|---:|---:|---:|---|
+| `0424` | Air / Air | 5 | 1 | 2 | HID if3，MCU if4 |
+| `0426` | Air 2 Ultra / Flora | 35 | 31 | 32 | kernel HID if1，MCU if0 |
+| `0428` | Air 2 / P55 | 23 | 19 | 20 | HID if3，MCU if4 |
+| `0432` | Air 2 Pro / P55E | 29 | 25 | 26 | HID if3，MCU if4 |
+| `0436` | One Pro / Gina | 41 | 37 | 38 | USB Ethernet，MCU if0 |
+| `0438` | One / GF | 47 | 43 | 44 | USB Ethernet，MCU if0 |
+| `043a` | Hylla | 53 | 49 | 50 | kernel HID if1，MCU if0 |
+| `043c` | CP（官方内部代号） | 65 | — | — | USB Ethernet，MCU if0 |
+| `043e` | One S / GS | 71 | 未在本版常量中命名 | 未命名 | USB Ethernet，MCU if0 |
+| `0440` | XBX A01 / Helen | 83 | 79 | 80 | Helen HID if1，MCU if0 |
+| `0442` | XBX A01 Plus / Helen Pro | 89 | 84 | 85 | Helen HID if1，MCU if0 |
+
+另有 VIDDA/XREAL `109b:6002` boot 和 `109b:6003` kernel（official type
+58/59，IMU/VSync logical type 55/56），以及 Flora `5343:0200`、Gina
+`4142:9411` recovery 身份。Sensor Probe 会识别这些状态，但不会向 boot/recovery
+设备发送运行期传感器命令。
 
 相邻的奇数 PID 是对应 bootloader 身份，不应发送普通传感器命令。
 
@@ -54,9 +60,13 @@ XBX A01 暴露三个 HID interrupt interface：
 
 因此代码必须保留两条独立实现路径：
 
-- Air、Air 2、Air 2 Pro、Air 2 Ultra、Light/OV580 等旧型号继续使用
-  `ar-drivers-rs` 和公开旧协议对应的实现。
-- Helen/XBX 使用本文记录的官方 AR Launcher 初始化与报告协议。
+- Air、Air 2、Air 2 Pro、Light/OV580 使用公开旧协议对应的实现。
+- Flora/Hylla 使用官方标记的 kernel IMU 分派和版本化 64-byte schema；其启动不套用
+  Helen 的 MCU heartbeat 时序。它们仍使用官方通用 AA 控制层，在同一个 interface
+  claim 和单个异步 URB 生命周期内执行 stop、读取完整校准 blob、sync、start。
+- Helen/Helen Pro 使用本文记录的官方 AR Launcher 初始化与报告协议。
+- Gina/GF/GS/CP/VIDDA 的 IMU 是 USB Ethernet 路径；HID/MCU interface 仍独立读取，
+  不能因为启动网络 reader 就提前结束 USB session。
 
 设备同为 `0x3318` VID 并不表示协议兼容。必须先按 PID/官方 driver family
 路由，不能因为 endpoint 都是 HID interrupt 就向 XBX 发送旧 Air 启动命令，或向
@@ -182,10 +192,19 @@ temperature = i16(2) / 326.8 + 25                     // °C
 
 设备时间戳应作为摄像头/IMU 时间对齐的原始时钟保存；不要用 Android 收包时间覆盖它。
 
+官方 `libnr_service.so` 同时内嵌了 report version 1 和 version 2 schema，不能仅按
+型号硬编码布局。version 1 同样是 64 字节，但 gyro/accel 是 i16：gyro 位于
+18/20/22，accel 位于 30/32/34，mag 位于 42/44/46，sensor timestamp 位于 48；
+version 2 使用上表的 i24 布局。Sensor Probe 现在读取 byte 1 后选择对应布局，缩放
+分子和除数仍逐帧读取，因此兼容官方列出的 `0x20210601`、`0x20220101` 和
+`0x20260323` 三套 schema。
+
 ## 证据范围
 
 - XBX A01 的完整冷启动、校准读取、版本握手和实时 IMU：真机验证。
 - FD/AA frame、CRC、命令顺序：官方 SO 静态分析与 Frida/libusb 动态抓包交叉验证。
+- Flora/Hylla：官方 logical type、interface 和通用 AA 初始化链已对齐；真实固件仍需
+  对应眼镜做最终运行验证，代码不会再把 logical type 相同误当成 Helen MCU 时序相同。
 - `0x6cxx` 事件名称：官方实现和现有解析器映射，部分事件仍缺少对应硬件场景验证。
 - 其他 XREAL 型号：仅确认官方设备表和接口映射；使用前应分别抓包验证。
 

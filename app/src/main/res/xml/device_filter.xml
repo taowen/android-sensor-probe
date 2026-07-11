@@ -1,6 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <usb-device vendor-id="13080" /> <!-- XREAL 0x3318 -->
+    <usb-device vendor-id="4251" />  <!-- VIDDA/XREAL 0x109b -->
+    <usb-device vendor-id="21315" product-id="512" /> <!-- Flora recovery -->
+    <usb-device vendor-id="16722" product-id="37905" /> <!-- Gina recovery -->
     <usb-device vendor-id="13770" /> <!-- VITURE 0x35ca -->
     <usb-device vendor-id="7099" />  <!-- RayNeo 0x1bbb -->
     <usb-device vendor-id="1234" />  <!-- Rokid 0x04d2 -->

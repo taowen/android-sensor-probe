@@ -10,7 +10,7 @@ object LibusbNative {
     external fun controlTransfer(handle:Long,type:Int,request:Int,value:Int,index:Int,data:ByteArray,length:Int,timeout:Int):Int
     external fun startEndpointReader(handle:Long,endpoint:Int,transferType:Int,packetSize:Int):Int
     external fun readEndpoint(handle:Long,endpoint:Int,data:ByteArray,timeout:Int):Int
-    external fun startXrealHelenReceiver(handle:Long):String
+    external fun startXrealHelenReceiver(handle:Long,helenBootstrap:Boolean):String
     external fun readXrealHelen(handle:Long,data:ByteArray,timeout:Int):Int
     external fun close(handle:Long)
 }

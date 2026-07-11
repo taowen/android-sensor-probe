@@ -185,7 +185,8 @@ void xrealHelenDestroy(ProbeUsb* usb) {
 }
 
 extern "C" JNIEXPORT jstring JNICALL
-Java_io_github_sensorprobe_LibusbNative_startXrealHelenReceiver(JNIEnv* env, jobject, jlong value) {
+Java_io_github_sensorprobe_LibusbNative_startXrealHelenReceiver(JNIEnv* env, jobject, jlong value,
+                                                                jboolean helenBootstrap) {
     auto* usb = probeUsbFrom(value);
     if (!usb) return env->NewStringUTF("XREAL Helen：无 libusb handle");
     xrealHelenDestroy(usb);
@@ -200,8 +201,13 @@ Java_io_github_sensorprobe_LibusbNative_startXrealHelenReceiver(JNIEnv* env, job
     bool imuStop = false, imuLength = false, imuSync = false, imuStart = false;
     int imuExpected = 0, imuReceived = 0;
 
-    if (libusb_kernel_driver_active(usb->handle, 0) == 1) libusb_detach_kernel_driver(usb->handle, 0);
-    if (libusb_claim_interface(usb->handle, 0) == LIBUSB_SUCCESS) {
+    bool mcuReady = !helenBootstrap;
+    if (helenBootstrap) {
+        if (libusb_kernel_driver_active(usb->handle, 0) == 1) libusb_detach_kernel_driver(usb->handle, 0);
+        mcuReady = libusb_claim_interface(usb->handle, 0) == LIBUSB_SUCCESS;
+    }
+    if (mcuReady) {
+      if (helenBootstrap) {
         const std::array<uint16_t, 6> commands{0x26, 0x57, 0x12, 0x02, 0x34, 0x35};
         for (size_t index = 0; index < commands.size(); ++index) {
             std::vector<unsigned char> body;
@@ -230,6 +236,7 @@ Java_io_github_sensorprobe_LibusbNative_startXrealHelenReceiver(JNIEnv* env, job
             heartbeatBytes = probeInterrupt(usb->handle, 0x03, packet.data(), packet.size(), 750);
             heartbeatAck = readFdAck(usb, requestId, 0x1a, 300) || heartbeatAck;
         }
+      }
 
         if (libusb_kernel_driver_active(usb->handle, 1) == 1) libusb_detach_kernel_driver(usb->handle, 1);
         imuClaim = libusb_claim_interface(usb->handle, 1);
@@ -259,10 +266,13 @@ Java_io_github_sensorprobe_LibusbNative_startXrealHelenReceiver(JNIEnv* env, job
                 if (bytes <= 0) break;
                 imuReceived += bytes;
             }
+            // Present in the official common transport. Older Air-family
+            // implementations tolerate it; Helen requires it before start.
             imuSync = !imuCommand(0x1a).empty();
             imuStart = !imuCommand(0x19, {1}).empty();
 
-            session->heartbeatRunning = true;
+            session->heartbeatRunning = helenBootstrap;
+            if (helenBootstrap)
             session->heartbeatThread = std::thread([session] {
                 uint32_t requestId = 10;
                 while (session->heartbeatRunning) {
@@ -280,7 +290,8 @@ Java_io_github_sensorprobe_LibusbNative_startXrealHelenReceiver(JNIEnv* env, job
     }
 
     std::ostringstream result;
-    result << "XREAL Helen 单 URB 官方队列 · claim IMU=" << imuClaim
+    result << "XREAL " << (helenBootstrap ? "Helen" : "kernel HID")
+           << " 单 URB 官方队列 · claim IMU=" << imuClaim
            << " · endpoint 0x84 async=" << (session->running ? "已提交" : "失败")
            << " · MCU heartbeat=" << heartbeatBytes << "/30"
            << " ACK=" << (heartbeatAck ? "成功" : "失败")

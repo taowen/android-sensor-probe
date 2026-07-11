@@ -7,8 +7,13 @@ data class XrealUsbProfile(
     val driverFamily:String,
     val bootloader:Boolean,
     val imuInterface:Int?,
-    val mcuInterface:Int?
+    val mcuInterface:Int?,
+    val imuLogicalType:Int? = null,
+    val vsyncLogicalType:Int? = null,
+    val sensorTransport:XrealSensorTransport = XrealSensorTransport.HID
 )
+
+enum class XrealSensorTransport { HID, HELEN_HID, USB_ETHERNET, NONE }
 
 data class GlassesModel(val brand: String, val model: String, val protocol: Protocol, val capabilities:String="USB 接口探测",val xreal:XrealUsbProfile?=null) {
     enum class Protocol { XREAL_AIR, XREAL_LIGHT_MCU, XREAL_LIGHT_OV580, ROKID, GRAWOOW_MCU, GRAWOOW_OV580, MAD_GAZE, VITURE, VITURE_PASSIVE, RAYNEO, GENERIC }
@@ -16,22 +21,36 @@ data class GlassesModel(val brand: String, val model: String, val protocol: Prot
 }
 
 object ModelCatalog {
-    private data class XrealEntry(val name:String,val type:Int,val family:String,val boot:Boolean,val imu:Int?,val mcu:Int?)
+    private data class XrealEntry(val name:String,val type:Int,val family:String,val boot:Boolean,
+                                  val imu:Int?,val mcu:Int?,val imuType:Int?=null,val vsyncType:Int?=null,
+                                  val transport:XrealSensorTransport=XrealSensorTransport.HID)
     private enum class VitureKind { GEN1, GEN2, CARINA, COMPANION }
     private data class VitureEntry(val name:String,val generation:String,val capabilities:String,val kind:VitureKind)
     // Extracted from the official Beam Pro 2.1.0 driver tables. Odd PIDs are
     // bootloader identities; even PIDs are the normal application identities.
     private val xreal = mapOf(
-        0x0423 to XrealEntry("Air Bootloader",2,"Air",true,null,null), 0x0424 to XrealEntry("Air",2,"Air",false,3,4),
-        0x0425 to XrealEntry("Air 2 Ultra Bootloader",5,"Flora",true,null,null), 0x0426 to XrealEntry("Air 2 Ultra",5,"Flora",false,1,0),
-        0x0427 to XrealEntry("Air 2 Bootloader",4,"P55",true,null,null), 0x0428 to XrealEntry("Air 2",4,"P55",false,3,4),
-        0x0431 to XrealEntry("Air 2 Pro Bootloader",3,"P55E",true,null,null), 0x0432 to XrealEntry("Air 2 Pro",3,"P55E",false,3,4),
-        0x0435 to XrealEntry("One Pro Bootloader",6,"Gina",true,null,null), 0x0436 to XrealEntry("One Pro",6,"Gina",false,null,0),
-        0x0437 to XrealEntry("One Bootloader",7,"GF",true,null,null), 0x0438 to XrealEntry("One",7,"GF",false,null,0),
-        0x0439 to XrealEntry("Hylla Bootloader",8,"Hylla",true,null,null), 0x043a to XrealEntry("Hylla",8,"Hylla",false,1,0),
-        0x043d to XrealEntry("One S Bootloader",9,"GS",true,null,null), 0x043e to XrealEntry("One S",9,"GS",false,null,0),
-        0x043f to XrealEntry("XBX A01 Bootloader",10,"Helen",true,null,null), 0x0440 to XrealEntry("XBX A01",10,"Helen",false,1,0),
-        0x0441 to XrealEntry("XBX A01 Plus Bootloader",11,"Helen Pro",true,null,null), 0x0442 to XrealEntry("XBX A01 Plus",11,"Helen Pro",false,1,0)
+        0x0423 to XrealEntry("Air Bootloader",4,"Air",true,null,null,transport=XrealSensorTransport.NONE),
+        0x0424 to XrealEntry("Air",5,"Air",false,3,4,1,2),
+        0x0425 to XrealEntry("Air 2 Ultra Bootloader",34,"Flora",true,null,null,transport=XrealSensorTransport.NONE),
+        0x0426 to XrealEntry("Air 2 Ultra",35,"Flora",false,1,0,31,32),
+        0x0427 to XrealEntry("Air 2 Bootloader",22,"P55",true,null,null,transport=XrealSensorTransport.NONE),
+        0x0428 to XrealEntry("Air 2",23,"P55",false,3,4,19,20),
+        0x0431 to XrealEntry("Air 2 Pro Bootloader",28,"P55E",true,null,null,transport=XrealSensorTransport.NONE),
+        0x0432 to XrealEntry("Air 2 Pro",29,"P55E",false,3,4,25,26),
+        0x0435 to XrealEntry("One Pro Bootloader",40,"Gina",true,null,null,transport=XrealSensorTransport.NONE),
+        0x0436 to XrealEntry("One Pro",41,"Gina",false,null,0,37,38,XrealSensorTransport.USB_ETHERNET),
+        0x0437 to XrealEntry("One Bootloader",46,"GF",true,null,null,transport=XrealSensorTransport.NONE),
+        0x0438 to XrealEntry("One",47,"GF",false,null,0,43,44,XrealSensorTransport.USB_ETHERNET),
+        0x0439 to XrealEntry("Hylla Bootloader",52,"Hylla",true,null,null,transport=XrealSensorTransport.NONE),
+        0x043a to XrealEntry("Hylla",53,"Hylla",false,1,0,49,50),
+        0x043b to XrealEntry("CP Bootloader",64,"CP",true,null,null,transport=XrealSensorTransport.NONE),
+        0x043c to XrealEntry("CP",65,"CP",false,null,0,transport=XrealSensorTransport.USB_ETHERNET),
+        0x043d to XrealEntry("One S Bootloader",70,"GS",true,null,null,transport=XrealSensorTransport.NONE),
+        0x043e to XrealEntry("One S",71,"GS",false,null,0,transport=XrealSensorTransport.USB_ETHERNET),
+        0x043f to XrealEntry("XBX A01 Bootloader",82,"Helen",true,null,null,transport=XrealSensorTransport.NONE),
+        0x0440 to XrealEntry("XBX A01",83,"Helen",false,1,0,79,80,XrealSensorTransport.HELEN_HID),
+        0x0441 to XrealEntry("XBX A01 Plus Bootloader",88,"Helen Pro",true,null,null,transport=XrealSensorTransport.NONE),
+        0x0442 to XrealEntry("XBX A01 Plus",89,"Helen Pro",false,1,0,84,85,XrealSensorTransport.HELEN_HID)
     )
     // VITURE SDK 2.3.2: get_market_name()/is_product_id_valid() and the
     // official Android demo USB filter. 0x1301 (Pro 2) is accepted by the
@@ -60,10 +79,18 @@ object ModelCatalog {
 
     fun identify(d: UsbDevice): GlassesModel = when (d.vendorId) {
         0x3318 -> xreal[d.productId]?.let { e ->
-            val profile=XrealUsbProfile(e.type,e.family,e.boot,e.imu,e.mcu)
+            val profile=XrealUsbProfile(e.type,e.family,e.boot,e.imu,e.mcu,e.imuType,e.vsyncType,e.transport)
             GlassesModel("XREAL",e.name,if(e.boot)GlassesModel.Protocol.GENERIC else GlassesModel.Protocol.XREAL_AIR,
-                if(e.boot)"官方 ${e.family} Bootloader · 仅识别/固件模式" else "官方 type ${e.type} / ${e.family} · IMU · VSync · MCU 事件 · 显示模式",profile)
+                if(e.boot)"官方 ${e.family} Bootloader · 仅识别/固件模式" else "官方 type ${e.type} / ${e.family} · IMU type ${e.imuType ?: "未公开"} · VSync type ${e.vsyncType ?: "未公开"} · MCU",profile)
         } ?: GlassesModel("XREAL",d.productName?:"未知型号 (PID ${d.productId.hex4()})",GlassesModel.Protocol.GENERIC,"官方 APK 未收录的 0x3318 设备")
+        0x109b -> when(d.productId) {
+            0x6002 -> GlassesModel("VIDDA / XREAL","One Pro Bootloader",GlassesModel.Protocol.GENERIC,"官方 type 58 · VIDDA U-Boot")
+            0x6003 -> GlassesModel("VIDDA / XREAL","One Pro",GlassesModel.Protocol.XREAL_AIR,"官方 type 59 · VIDDA kernel · USB Ethernet IMU/MCU",
+                XrealUsbProfile(59,"VIDDA",false,null,0,55,56,XrealSensorTransport.USB_ETHERNET))
+            else -> GlassesModel("VIDDA / XREAL",d.productName?:"未知型号",GlassesModel.Protocol.GENERIC)
+        }
+        0x5343 -> if(d.productId==0x0200) GlassesModel("XREAL","Air 2 Ultra Recovery",GlassesModel.Protocol.GENERIC,"官方 type 33 · Flora ROM recovery") else GlassesModel("USB",d.productName?:"未知设备",GlassesModel.Protocol.GENERIC)
+        0x4142 -> if(d.productId==0x9411) GlassesModel("XREAL","One Pro Recovery",GlassesModel.Protocol.GENERIC,"官方 type 39 · Gina ROM recovery") else GlassesModel("USB",d.productName?:"未知设备",GlassesModel.Protocol.GENERIC)
         0x0486 -> if(d.productId==0x573c) GlassesModel("XREAL", "Light MCU", GlassesModel.Protocol.XREAL_LIGHT_MCU,"按键 · 接近 · 环境光 · VSync · 显示模式") else GlassesModel("USB",d.productName?:"未知设备",GlassesModel.Protocol.GENERIC)
         0x05a9 -> when(d.productId){
             0x0680 -> GlassesModel("XREAL","Light OV580",GlassesModel.Protocol.XREAL_LIGHT_OV580,"IMU · RGB相机 · 双SLAM相机")
