@@ -189,5 +189,48 @@ temperature = i16(2) / 326.8 + 25                     // °C
 - `0x6cxx` 事件名称：官方实现和现有解析器映射，部分事件仍缺少对应硬件场景验证。
 - 其他 XREAL 型号：仅确认官方设备表和接口映射；使用前应分别抓包验证。
 
-实现位置：[`libusb_jni.cpp`](../app/src/main/cpp/libusb_jni.cpp) 和
+实现位置：[`xreal_helen.cpp`](../app/src/main/cpp/xreal_helen.cpp)、
+[`libusb_jni.cpp`](../app/src/main/cpp/libusb_jni.cpp) 和
 [`ProtocolDecoders.kt`](../app/src/main/java/io/github/sensorprobe/ProtocolDecoders.kt)。
+
+## Sensor Probe 数据流与 ownership
+
+native 层刻意区分设备所有权和厂商协议状态：
+
+```text
+UsbDeviceConnection (Kotlin)
+  └─ MultiSession owns native handle
+       └─ ProbeUsb owns libusb_context + libusb_device_handle
+            ├─ owns generic EndpointReader[]
+            └─ owns optional XrealHelenSession
+                 ├─ borrows ProbeUsb context/handle
+                 ├─ owns endpoint 0x84 transfer + packet queue
+                 └─ owns event-loop thread + heartbeat thread
+```
+
+数据方向如下：
+
+```text
+USB 0x84
+  → libusb callback
+  → XrealHelenSession bounded queue
+  → readXrealHelen JNI
+  → Kotlin Session reader thread
+  → XbxA01Protocol.decode()
+  → SensorReading/UI/log
+```
+
+`XrealHelenSession` 不得关闭 `libusb_device_handle` 或退出 context。资源只由父级
+`ProbeUsb` 关闭。Kotlin `MultiSession.close()` 先停止所有消费线程，再调用 native
+`close()`；native 的关闭顺序为：
+
+1. 停止并 join heartbeat，保证不再写 `0x03/0x82`。
+2. cancel 通用 endpoint readers。
+3. 保持 Helen event loop 存活，直到 cancel callback 已分发。
+4. cancel/free Helen `0x84` transfer 并销毁 Helen session。
+5. free 通用 transfers。
+6. 最后关闭 device handle、退出 libusb context、删除 `ProbeUsb`。
+
+这个顺序避免 callback、Kotlin reader 或 heartbeat 在线程退出后继续访问已经释放的
+handle/session。Helen 活跃时它的 event loop 是该 libusb context 唯一的事件循环，也会
+分发同一 context 上的通用 endpoint callback，避免两个线程并发调用 libusb event API。
