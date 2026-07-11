@@ -12,6 +12,7 @@ import android.view.View
 import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
+import androidx.core.content.FileProvider
 import java.io.BufferedWriter
 import java.io.File
 import java.io.FileWriter
@@ -19,6 +20,7 @@ import java.time.Instant
 
 class MainActivity : AppCompatActivity(), UsbGlassesReader.Listener {
     private lateinit var reader: UsbGlassesReader
+    private lateinit var recorder:DiagnosticRecorder
     private lateinit var devicesBox: LinearLayout
     private lateinit var reading: TextView
     private lateinit var status: TextView
@@ -32,6 +34,9 @@ class MainActivity : AppCompatActivity(), UsbGlassesReader.Listener {
     private lateinit var slamStatus:TextView
     private lateinit var xrealMcuSection:LinearLayout
     private lateinit var vitureBeastMcuSection:LinearLayout
+    private lateinit var diagnosticStatus:TextView
+    private lateinit var finishReportButton:Button
+    private lateinit var shareReportButton:Button
     private var debugLog:BufferedWriter?=null
     private lateinit var debugLogFile:File
     @Volatile private var lastReadingUiNanos=0L
@@ -47,6 +52,10 @@ class MainActivity : AppCompatActivity(), UsbGlassesReader.Listener {
         val root=LinearLayout(this).apply { orientation=LinearLayout.VERTICAL; setPadding(32,32,32,32); setBackgroundColor(Color.rgb(16,20,24)) }
         fun label(text:String,size:Float=16f)=TextView(this).apply { this.text=text; textSize=size; setTextColor(Color.WHITE); setPadding(0,12,0,12) }
         root.addView(label("AR 眼镜传感器探针",26f))
+        root.addView(label("社区诊断报告",19f))
+        diagnosticStatus=label("点击下方设备后会在连接前自动开始录制。完成动作后生成 ZIP。",14f).also(root::addView)
+        finishReportButton=Button(this).apply{text="停止录制并生成报告";isEnabled=false;setOnClickListener{finishReport()}};root.addView(finishReportButton)
+        shareReportButton=Button(this).apply{text="分享最近的诊断 ZIP";isEnabled=false;setOnClickListener{shareLastReport()}};root.addView(shareReportButton)
         status=label("正在扫描 USB…\n日志：${debugLogFile.absolutePath}",14f).also(root::addView)
         root.addView(label("眼镜/USB 外接摄像头（不含手机内置）",19f)); cameras=label("正在枚举…",14f).also(root::addView)
         cameraPreviews=LinearLayout(this).apply{orientation=LinearLayout.VERTICAL};root.addView(cameraPreviews)
@@ -87,23 +96,25 @@ class MainActivity : AppCompatActivity(), UsbGlassesReader.Listener {
         slamLeft=ImageView(this).apply{adjustViewBounds=true};slamRight=ImageView(this).apply{adjustViewBounds=true}
         slamBox.addView(slamLeft,LinearLayout.LayoutParams(0,LinearLayout.LayoutParams.WRAP_CONTENT,1f));slamBox.addView(slamRight,LinearLayout.LayoutParams(0,LinearLayout.LayoutParams.WRAP_CONTENT,1f));slamSection.addView(slamBox);root.addView(slamSection)
         val scroll=ScrollView(this).apply { addView(root) }; setContentView(scroll)
-        reader=UsbGlassesReader(this,this); reader.scan(); enumerateCameras();handleDebugCommand(intent)
+        recorder=DiagnosticRecorder(this);reader=UsbGlassesReader(this,this,recorder); reader.scan(); enumerateCameras();handleDebugCommand(intent)
     }
     override fun onNewIntent(intent:Intent){super.onNewIntent(intent);setIntent(intent);handleDebugCommand(intent)}
     private fun handleDebugCommand(intent:Intent?){
         when(intent?.getStringExtra("command")){
+            "connect_xreal"->getSystemService(UsbManager::class.java).deviceList.values.firstOrNull{it.vendorId==0x3318}?.let(reader::connect)
             "connect_beast"->getSystemService(UsbManager::class.java).deviceList.values.firstOrNull{it.vendorId==0x35ca&&(it.productId==0x1201||it.productId==0x1211)}?.let(reader::connect)
             "connect_viture"->getSystemService(UsbManager::class.java).deviceList.values.firstOrNull{ModelCatalog.identify(it).protocol in setOf(GlassesModel.Protocol.VITURE,GlassesModel.Protocol.VITURE_PASSIVE)}?.let(reader::connect)
             "query_beast"->reader.queryVitureBeastMode()
             "set_2d"->reader.setVitureBeastDimension(false)
             "set_3d"->reader.setVitureBeastDimension(true)
+            "finish_report"->finishReport()
         }
         intent?.removeExtra("command")
     }
     override fun onDestroy(){
         reader.close()
         (0 until cameraPreviews.childCount).map{cameraPreviews.getChildAt(it)}.filterIsInstance<ExternalCameraPreview>().forEach{it.close()}
-        logLine("SESSION END")
+        if(recorder.active)recorder.finish();logLine("SESSION END")
         debugLog?.close();debugLog=null
         super.onDestroy()
     }
@@ -113,7 +124,7 @@ class MainActivity : AppCompatActivity(), UsbGlassesReader.Listener {
         if(devices.isEmpty()) devicesBox.addView(text("未发现 USB Host 设备。请确认手机支持 OTG，且转接链路保留 USB 数据。"))
         devices.forEach { d ->
             val m=ModelCatalog.identify(d)
-            val b=Button(this).apply { text="${m.displayName}  ${d.vendorId.hex4()}:${d.productId.hex4()}"; setOnClickListener { reader.connect(d) } }
+            val b=Button(this).apply { text="${m.displayName}  ${d.vendorId.hex4()}:${d.productId.hex4()}"; setOnClickListener { reader.connect(d);diagnosticStatus.text="正在录制 ${m.displayName}。请静止、绕三轴转动、按键并测试佩戴事件。";finishReportButton.isEnabled=true } }
             devicesBox.addView(b); devicesBox.addView(text("能力：${m.capabilities}\n${describe(d)}"))
         }
         slamSection.visibility=if(devices.any{it.vendorId==0x05a9&&it.productId==0x0680})View.VISIBLE else View.GONE
@@ -121,9 +132,10 @@ class MainActivity : AppCompatActivity(), UsbGlassesReader.Listener {
         vitureBeastMcuSection.visibility=if(devices.any{it.vendorId==0x35ca&&(it.productId==0x1201||it.productId==0x1211)})View.VISIBLE else View.GONE
         enumerateCameras()
     }
-    override fun onStatus(message:String){logLine("STATUS $message");runOnUiThread { status.text="$message\n日志：${debugLogFile.absolutePath}" }}
+    override fun onStatus(message:String){logLine("STATUS $message");if(::recorder.isInitialized)recorder.event("app","status",mapOf("message" to message));runOnUiThread { status.text="$message\n日志：${debugLogFile.absolutePath}" }}
     override fun onReading(reading:SensorReading) {
         val r=reading
+        if(::recorder.isInitialized)recorder.reading(r)
         fun vec(name:String,v:FloatArray?,unit:String) = v?.let { "$name  ${it.joinToString("  "){x->"%+.4f".format(x)}} $unit\n" } ?: ""
         val formatted=buildString {
             append("${r.source}\n")
@@ -177,7 +189,16 @@ class MainActivity : AppCompatActivity(), UsbGlassesReader.Listener {
         }
         cameras.text=(usbLines+camera2Lines).joinToString("\n").ifEmpty { "未发现 USB Video Class 或 Camera2 外接摄像头。" }
         cameraPreviews.removeAllViews()
-        externalIds.forEach { cameraPreviews.addView(ExternalCameraPreview(this,it)) }
+        externalIds.forEach { cameraPreviews.addView(ExternalCameraPreview(this,it,if(::recorder.isInitialized)recorder else null)) }
     }
     @Synchronized private fun logLine(message:String){debugLog?.apply{write("${Instant.now()} $message\n");flush()}}
+    private fun finishReport(){
+        reader.stop();val file=recorder.finish();finishReportButton.isEnabled=false;shareReportButton.isEnabled=file!=null
+        diagnosticStatus.text=if(file!=null)"报告已生成：${file.name}\n${file.length()/1024} KiB" else "当前没有录制会话"
+    }
+    private fun shareLastReport(){
+        val file=recorder.lastReport?:return
+        val uri=FileProvider.getUriForFile(this,"$packageName.files",file)
+        startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply{type="application/zip";putExtra(Intent.EXTRA_STREAM,uri);addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);putExtra(Intent.EXTRA_SUBJECT,"Sensor Probe AR 眼镜诊断报告")},"分享诊断报告"))
+    }
 }

@@ -12,11 +12,12 @@ import android.view.TextureView
 import android.widget.FrameLayout
 import android.widget.TextView
 
-class ExternalCameraPreview(context:Context, private val cameraId:String):FrameLayout(context),TextureView.SurfaceTextureListener {
+class ExternalCameraPreview(context:Context, private val cameraId:String,private val recorder:DiagnosticRecorder?=null):FrameLayout(context),TextureView.SurfaceTextureListener {
     private val texture=TextureView(context)
     private val thread=HandlerThread("external-camera-$cameraId").apply{start()}
     private val handler=Handler(thread.looper)
     private var device:CameraDevice?=null
+    private var lastMetadataNs=0L
     init {
         addView(texture,LayoutParams(LayoutParams.MATCH_PARENT,560))
         addView(TextView(context).apply{text="外接 Camera2 · ID $cameraId";setPadding(12,12,12,12)})
@@ -39,6 +40,6 @@ class ExternalCameraPreview(context:Context, private val cameraId:String):FrameL
     override fun onSurfaceTextureAvailable(s:SurfaceTexture,w:Int,h:Int)=open(s)
     override fun onSurfaceTextureSizeChanged(s:SurfaceTexture,w:Int,h:Int){}
     override fun onSurfaceTextureDestroyed(s:SurfaceTexture):Boolean{device?.close();device=null;return true}
-    override fun onSurfaceTextureUpdated(s:SurfaceTexture){}
+    override fun onSurfaceTextureUpdated(s:SurfaceTexture){val now=android.os.SystemClock.elapsedRealtimeNanos();if(now-lastMetadataNs>=1_000_000_000L){lastMetadataNs=now;recorder?.cameraFrame("camera2_external_$cameraId",now,s.timestamp,0,true)}}
     fun close(){device?.close();thread.quitSafely()}
 }

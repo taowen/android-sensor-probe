@@ -10,7 +10,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 /** XREAL One/One Pro Ethernet IMU stream documented by the open-source One drivers. */
 class XrealOneTcpReader(
     private val onReading:(SensorReading)->Unit,
-    private val onStatus:(String)->Unit
+    private val onStatus:(String)->Unit,
+    private val recorder:DiagnosticRecorder
 ):Closeable {
     private val running=AtomicBoolean(true)
     private var socket:Socket?=null
@@ -19,19 +20,23 @@ class XrealOneTcpReader(
     private fun run() {
         val s=Socket();socket=s
         try {
+            recorder.event("tcp","connect_begin",mapOf("host" to "169.254.2.1","port" to 52998))
             s.connect(InetSocketAddress("169.254.2.1",52998),2000);s.soTimeout=3000
+            recorder.event("tcp","connected")
             onStatus("XREAL Ethernet IMU 已连接 169.254.2.1:52998")
             val stream=s.getInputStream();val pending=ArrayList<Byte>();val chunk=ByteArray(4096)
             while(running.get()) {
                 val n=stream.read(chunk);if(n<0)break
+                recorder.tcpChunk(chunk,n)
                 repeat(n){pending.add(chunk[it])}
                 while(true) {
                     val start=findHeader(pending);if(start<0){if(pending.size>6)pending.subList(0,pending.size-6).clear();break}
                     if(start>0)pending.subList(0,start).clear();if(pending.size<84)break
-                    val frame=ByteArray(84){pending[it]};pending.subList(0,84).clear();decode(frame)?.let(onReading)
+                    val frame=ByteArray(84){pending[it]};pending.subList(0,84).clear();decode(frame)?.let(onReading)?:recorder.decodeFailure("XrealOneTcp","invalid_84_byte_frame",84,frame.hex(16))
                 }
             }
         } catch(e:Exception) {
+            recorder.event("tcp","error",mapOf("type" to e.javaClass.simpleName,"message" to e.message))
             if(running.get())onStatus("XREAL Ethernet IMU 链路不可达（需 USB 网络链路）")
         } finally { try{s.close()}catch(_:Exception){} }
     }

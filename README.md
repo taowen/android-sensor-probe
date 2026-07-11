@@ -15,8 +15,9 @@
 - 通过 JNI/libusb 读取 XREAL Light OV580 双目 SLAM 原始帧
 - 对 XREAL Helen/XBX 执行官方 MCU 初始化序列和 IMU 校准读取/启动序列
 - 向公开协议支持的设备发送 2D、Full SBS、Half SBS 和高刷新率显示模式命令
+- 在打开设备前自动开始社区诊断录制，导出描述符、完整 USB/TCP 原始流、初始化时序、解析 CSV、相机时间戳和日志 ZIP
 
-详细资料见 [XREAL USB 协议](docs/xreal-usb-protocol.md)、[ar-drivers-rs 支持表](docs/ar-drivers-rs-support.md)和 [VITURE 官方 SDK 支持表](docs/viture-sdk-support.md)。
+详细资料见 [社区测试说明](docs/community-testing.md)、[XREAL USB 协议](docs/xreal-usb-protocol.md)、[ar-drivers-rs 支持表](docs/ar-drivers-rs-support.md)和 [VITURE 官方 SDK 支持表](docs/viture-sdk-support.md)。
 
 > [!WARNING]
 > 本项目处于实验阶段。显示模式命令会直接改变眼镜状态；只应在确认型号后使用。XBX A01 的 MCU 初始化、SDK 版本握手和显示模式封包来自对官方 AR Launcher APK 的静态分析与实机动态验证。
@@ -57,6 +58,7 @@ ADB_SERIAL=192.168.1.60:33491 scripts/install-debug.sh
 - `Models.kt`：USB VID/PID 和型号能力表
 - `ProtocolDecoders.kt`：传感器与 MCU 报告解析
 - `UsbGlassesReader.kt`：USB Host 会话和显示模式控制
+- `DiagnosticRecorder.kt`：社区测试会话、描述符/原始数据/CSV 录制与 ZIP 分享
 - `LibusbNative.kt`、`cpp/libusb_jni.cpp`：Android 文件描述符到 libusb 的统一传输层、异步 endpoint reader、Helen 官方时序
 - `ExternalCameraPreview.kt`：外接 Camera2 预览
 - `Ov580Native.kt`、`cpp/ov580_jni.cpp`：OV580 双目 SLAM JNI 读取链路

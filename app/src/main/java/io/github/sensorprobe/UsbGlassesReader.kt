@@ -13,7 +13,7 @@ import android.graphics.Bitmap
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
-class UsbGlassesReader(private val context: Context, private val listener: Listener) : Closeable {
+class UsbGlassesReader(private val context: Context, private val listener: Listener, private val recorder:DiagnosticRecorder) : Closeable {
     enum class DisplayMode { MIRROR_2D, FULL_SBS_3D, HALF_SBS, HIGH_REFRESH, HIGH_REFRESH_SBS }
     interface Listener {
         fun onDevicesChanged(devices: List<UsbDevice>)
@@ -52,6 +52,7 @@ class UsbGlassesReader(private val context: Context, private val listener: Liste
     fun scan() { listener.onDevicesChanged(manager.deviceList.values.sortedBy { it.deviceName }) }
     fun connect(device: UsbDevice) {
         stop()
+        recorder.begin(device);recorder.event("usb","connect_requested")
         if (!manager.hasPermission(device)) {
             pendingPermissionDevice=device
             // UsbManager uses fill-in extras for the device and grant result.
@@ -60,24 +61,26 @@ class UsbGlassesReader(private val context: Context, private val listener: Liste
         } else open(device)
     }
     private fun open(device: UsbDevice) {
+        recorder.event("usb","open_begin")
         val connection=manager.openDevice(device) ?: return listener.onStatus("无法打开 USB 设备")
         if(device.vendorId==0x0c45 && (device.productId==0x6368 || device.productId==0x636b)) {
             activeConnection=connection;activeDevice=device
-            uvcReader=UvcCameraReader(connection.fileDescriptor,listener::onUvcFrame)
+            uvcReader=UvcCameraReader(connection.fileDescriptor,{bitmap->listener.onUvcFrame(bitmap)},recorder)
             listener.onStatus(if(uvcReader?.started==true)"${ModelCatalog.identify(device).displayName} · ${uvcReader?.transport} · 1920×1080@30 MJPEG 已启动" else "UVC/libusb 启动失败")
             return
         }
         val nativeHandle=LibusbNative.open(connection.fileDescriptor)
         if(nativeHandle==0L){connection.close();return listener.onStatus("libusb_wrap_sys_device 失败")}
         activeConnection=connection;activeLibusbHandle=nativeHandle;activeDevice=device
+        recorder.nativeTracePath?.let { recorder.event("native_trace","start",mapOf("ok" to LibusbNative.startTrace(nativeHandle,it))); }
         val model=ModelCatalog.identify(device)
         val networkSensors=model.xreal?.sensorTransport==XrealSensorTransport.USB_ETHERNET
         if(networkSensors) {
-            helenTcpReader=XrealOneTcpReader(listener::onReading) { listener.onStatus(it) }.also { it.start() }
+            helenTcpReader=XrealOneTcpReader(listener::onReading,{listener.onStatus(it)},recorder).also { it.start() }
             listener.onStatus("正在连接 ${model.displayName} 的 USB Ethernet IMU；MCU interface ${model.xreal.mcuInterface}")
         }
         if(device.vendorId==0x05a9 && device.productId==0x0680) {
-            slamReader=Ov580SlamReader(connection.fileDescriptor,listener::onSlamFrame)
+            slamReader=Ov580SlamReader(connection.fileDescriptor,listener::onSlamFrame,recorder)
             listener.onStatus(if(slamReader?.started==true)"OV580 双 SLAM 相机已启动" else "OV580 SLAM JNI启动失败")
         }
         val protocol=when(model.protocol){
@@ -103,7 +106,10 @@ class UsbGlassesReader(private val context: Context, private val listener: Liste
             val byEndpoint=allHid.filter { intf->(0 until intf.endpointCount).any { intf.getEndpoint(it).address==0x84 } }
             val imu=byOfficial.ifEmpty { byEndpoint.ifEmpty { allHid } }
             val mcu=if(nativeHelenInit) emptyList() else allInterfaces.filter { it.id==model.xreal?.mcuInterface }
-            (imu+mcu).distinctBy { it.id }
+            // Unknown HID interfaces are valuable protocol evidence. Listen
+            // passively, but never send the IMU start command to them.
+            val auxiliary=allHid.filter { it.id!=model.xreal?.imuInterface && it.id!=model.xreal?.mcuInterface }
+            (imu+mcu+auxiliary).distinctBy { it.id }
         } else when(model.protocol) {
             GlassesModel.Protocol.ROKID -> allInterfaces.filter { i -> (0 until i.endpointCount).any { i.getEndpoint(it).address==0x82 || i.getEndpoint(it).address==0x83 } }
             GlassesModel.Protocol.GRAWOOW_OV580 -> allInterfaces.filter { i -> (0 until i.endpointCount).any { i.getEndpoint(it).address==0x89 } }
@@ -118,9 +124,12 @@ class UsbGlassesReader(private val context: Context, private val listener: Liste
             val nativeImu=(nativeHelenInit||nativeKernelInit) && intf.id==model.xreal?.imuInterface
             if(input == null || (!nativeImu && LibusbNative.claim(nativeHandle,intf.id)!=0)) continue
             val output=(0 until intf.endpointCount).map{intf.getEndpoint(it)}.firstOrNull { it.direction == UsbConstants.USB_DIR_OUT }
-            val interfaceProtocol=if(model.protocol==GlassesModel.Protocol.XREAL_AIR && intf.id==model.xreal?.mcuInterface)
-                XbxMcuEventProtocol(intf.id) else protocol
-            sessions += Session(nativeHandle,intf,input,output,interfaceProtocol,listener, passiveOnly = nativeImu)
+            val interfaceProtocol=when {
+                model.protocol==GlassesModel.Protocol.XREAL_AIR && intf.id==model.xreal?.mcuInterface -> XbxMcuEventProtocol(intf.id)
+                model.protocol==GlassesModel.Protocol.XREAL_AIR && intf.id!=model.xreal?.imuInterface -> RawUsbProtocol
+                else -> protocol
+            }
+            sessions += Session(nativeHandle,intf,input,output,interfaceProtocol,listener,recorder, passiveOnly = nativeImu)
         }
         if(sessions.isEmpty()){ LibusbNative.close(nativeHandle);connection.close(); listener.onStatus("未找到可读取的 HID IN 接口"); return }
         session=MultiSession(nativeHandle,connection,sessions).also { it.start() }
@@ -229,14 +238,14 @@ class UsbGlassesReader(private val context: Context, private val listener: Liste
         fun send(command:ByteArray)=sessions.firstOrNull{it.hasOutput}?.send(command)==command.size
         override fun close(){ sessions.forEach { it.stop() };LibusbNative.close(nativeHandle);connection.close() }
     }
-    private class Session(val nativeHandle:Long, val intf: UsbInterface, val input: UsbEndpoint, val output: UsbEndpoint?, val protocol: GlassesProtocol, val listener: Listener, val passiveOnly:Boolean): Closeable {
+    private class Session(val nativeHandle:Long, val intf: UsbInterface, val input: UsbEndpoint, val output: UsbEndpoint?, val protocol: GlassesProtocol, val listener: Listener,val recorder:DiagnosticRecorder, val passiveOnly:Boolean): Closeable {
         private val running=AtomicBoolean(true)
         private val thread=Thread({ run() }, "glasses-usb-reader")
         val hasOutput get()=output!=null
         @Synchronized fun send(command:ByteArray)=output?.let{transfer(it,command,command.size,500)}?:-1
         fun start(){
             if(!passiveOnly) {
-                val rc=LibusbNative.startEndpointReader(nativeHandle,input.address,input.type,maxOf(64,input.maxPacketSize))
+                val rc=LibusbNative.startEndpointReader(nativeHandle,intf.id,input.address,input.type,maxOf(64,input.maxPacketSize))
                 if(rc!=0)listener.onStatus("interface ${intf.id} 原生异步 reader 启动失败：$rc")
             }
             thread.start()
@@ -256,9 +265,10 @@ class UsbGlassesReader(private val context: Context, private val listener: Liste
                 val n=readInput(data)
                 if(n > 0){
                     misses=0; packets++
+                    recorder.usbPacket(intf.id,input.address,"in",0,data,n)
                     val decoded=protocol.decode(data,n)
                     if(decoded != null) listener.onReading(decoded)
-                    else if(packets <= 8 || packets % 100 == 0) listener.onReading(SensorReading("HID interface ${intf.id} · 原始报告 #$packets · ${n} bytes", rawHex=data.hex(n)))
+                    else {recorder.decodeFailure(protocol.javaClass.simpleName,"unsupported_or_invalid",n,data.hex(minOf(n,16)));if(packets <= 8 || packets % 100 == 0) listener.onReading(SensorReading("HID interface ${intf.id} · 原始报告 #$packets · ${n} bytes", rawHex=data.hex(n)))}
                 }
                 else if(++misses == 6) listener.onStatus("interface ${intf.id} 暂无 HID 报告；请摇动眼镜或按眼镜按键")
             }

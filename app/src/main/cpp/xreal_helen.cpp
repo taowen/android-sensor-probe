@@ -34,6 +34,8 @@ const XrealHelenSession* helen(const ProbeUsb* usb) {
 
 void LIBUSB_CALL transferCallback(libusb_transfer* transfer) {
     auto* session = static_cast<XrealHelenSession*>(transfer->user_data);
+    probeTrace(session->usb, TRACE_ASYNC_CALLBACK, 1, 1, 0x84, transfer->status, transfer->length,
+               transfer->buffer, transfer->status == LIBUSB_TRANSFER_COMPLETED ? transfer->actual_length : 0);
     if (transfer->status == LIBUSB_TRANSFER_COMPLETED && transfer->actual_length > 0) {
         std::vector<unsigned char> packet(transfer->buffer, transfer->buffer + transfer->actual_length);
         {
@@ -44,7 +46,9 @@ void LIBUSB_CALL transferCallback(libusb_transfer* transfer) {
         session->queueCondition.notify_all();
     }
     if (session->running && transfer->status != LIBUSB_TRANSFER_NO_DEVICE) {
-        if (libusb_submit_transfer(transfer) != LIBUSB_SUCCESS) session->transferActive = false;
+        const int result=libusb_submit_transfer(transfer);
+        probeTrace(session->usb,TRACE_ASYNC_RESUBMIT,1,1,0x84,result,transfer->length,nullptr,0);
+        if (result != LIBUSB_SUCCESS) session->transferActive = false;
     } else {
         session->transferActive = false;
         session->queueCondition.notify_all();
@@ -76,7 +80,10 @@ bool startReceiver(XrealHelenSession* session) {
             libusb_handle_events_timeout_completed(session->usb->context, &timeout, nullptr);
         }
     });
-    if (libusb_submit_transfer(session->transfer) == LIBUSB_SUCCESS) return true;
+    probeTrace(session->usb,TRACE_ASYNC_SUBMIT,1,1,0x84,0,session->buffer.size(),nullptr,0);
+    const int submitResult=libusb_submit_transfer(session->transfer);
+    if (submitResult == LIBUSB_SUCCESS) return true;
+    probeTrace(session->usb,TRACE_ASYNC_CALLBACK,1,1,0x84,submitResult,session->buffer.size(),nullptr,0);
     session->transferActive = false;
     session->running = false;
     if (session->eventThread.joinable()) session->eventThread.join();
@@ -147,7 +154,7 @@ uint64_t monotonicNanos() {
 bool readFdAck(ProbeUsb* usb, uint32_t requestId, uint16_t command, int timeoutMs) {
     for (int attempt = 0; attempt < 8; ++attempt) {
         std::array<unsigned char, 64> response{};
-        const int count = probeInterrupt(usb->handle, 0x82, response.data(), response.size(), timeoutMs);
+        const int count = probeInterrupt(usb, 0, 0x82, response.data(), response.size(), timeoutMs);
         if (count < 23 || response[0] != 0xfd) continue;
         const uint32_t responseId = response[7] | (response[8] << 8) |
             (response[9] << 16) | (response[10] << 24);
@@ -177,7 +184,10 @@ void xrealHelenDestroy(ProbeUsb* usb) {
     xrealHelenStopHeartbeat(usb);
     session->running = false;
     session->queueCondition.notify_all();
-    if (session->transfer && session->transferActive) libusb_cancel_transfer(session->transfer);
+    if (session->transfer && session->transferActive) {
+        const int result=libusb_cancel_transfer(session->transfer);
+        probeTrace(usb,TRACE_ASYNC_CANCEL,1,1,0x84,result,session->transfer->length,nullptr,0);
+    }
     if (session->eventThread.joinable()) session->eventThread.join();
     if (session->transfer) libusb_free_transfer(session->transfer);
     delete session;
@@ -215,7 +225,7 @@ Java_io_github_sensorprobe_LibusbNative_startXrealHelenReceiver(JNIEnv* env, job
             const uint32_t requestId = static_cast<uint32_t>(index + 1);
             const uint64_t stamp = monotonicNanos();
             auto packet = fdPacket(commands[index], body, requestId, static_cast<uint32_t>(stamp));
-            if (probeInterrupt(usb->handle, 0x03, packet.data(), packet.size(), 500) ==
+            if (probeInterrupt(usb, 0, 0x03, packet.data(), packet.size(), 500) ==
                     static_cast<int>(packet.size()) &&
                 readFdAck(usb, requestId, commands[index], 250)) {
                 ++mcuInitAcks;
@@ -225,7 +235,7 @@ Java_io_github_sensorprobe_LibusbNative_startXrealHelenReceiver(JNIEnv* env, job
         const uint64_t versionStamp = monotonicNanos();
         const std::vector<unsigned char> version{'3', '.', '1', '.', '1'};
         auto versionPacket = fdPacket(0x31, version, 7, static_cast<uint32_t>(versionStamp));
-        sdkVersionAck = probeInterrupt(usb->handle, 0x03, versionPacket.data(), versionPacket.size(), 750) ==
+        sdkVersionAck = probeInterrupt(usb, 0, 0x03, versionPacket.data(), versionPacket.size(), 750) ==
                 static_cast<int>(versionPacket.size()) && readFdAck(usb, 7, 0x31, 300);
 
         for (uint32_t requestId = 8; requestId <= 9; ++requestId) {
@@ -233,7 +243,7 @@ Java_io_github_sensorprobe_LibusbNative_startXrealHelenReceiver(JNIEnv* env, job
             std::vector<unsigned char> body(8);
             for (int i = 0; i < 8; ++i) body[i] = static_cast<unsigned char>(stamp >> (i * 8));
             auto packet = fdPacket(0x1a, body, requestId, static_cast<uint32_t>(stamp));
-            heartbeatBytes = probeInterrupt(usb->handle, 0x03, packet.data(), packet.size(), 750);
+            heartbeatBytes = probeInterrupt(usb, 0, 0x03, packet.data(), packet.size(), 750);
             heartbeatAck = readFdAck(usb, requestId, 0x1a, 300) || heartbeatAck;
         }
       }
@@ -244,7 +254,7 @@ Java_io_github_sensorprobe_LibusbNative_startXrealHelenReceiver(JNIEnv* env, job
             auto imuCommand = [session](unsigned char command,
                                         const std::vector<unsigned char>& payload = std::vector<unsigned char>{}) {
                 auto request = aaPacket(command, payload);
-                if (probeInterrupt(session->usb->handle, 0x05, request.data(), request.size(), 750) !=
+                if (probeInterrupt(session->usb, 1, 0x05, request.data(), request.size(), 750) !=
                     static_cast<int>(request.size())) return std::vector<unsigned char>{};
                 for (int attempt = 0; attempt < 12; ++attempt) {
                     auto response = pop(session, 500);
@@ -280,9 +290,9 @@ Java_io_github_sensorprobe_LibusbNative_startXrealHelenReceiver(JNIEnv* env, job
                     std::vector<unsigned char> payload(8);
                     for (int i = 0; i < 8; ++i) payload[i] = static_cast<unsigned char>(stamp >> (i * 8));
                     auto packet = fdPacket(0x1a, payload, requestId++, static_cast<uint32_t>(stamp));
-                    probeInterrupt(session->usb->handle, 0x03, packet.data(), packet.size(), 250);
+                    probeInterrupt(session->usb, 0, 0x03, packet.data(), packet.size(), 250);
                     std::array<unsigned char, 64> response{};
-                    probeInterrupt(session->usb->handle, 0x82, response.data(), response.size(), 100);
+                    probeInterrupt(session->usb, 0, 0x82, response.data(), response.size(), 100);
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 }
             });
