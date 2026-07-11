@@ -80,11 +80,41 @@ object XbxA01Protocol : GlassesProtocol {
         fun i24(o:Int):Int { val v=(bytes[o].toInt() and 255) or ((bytes[o+1].toInt() and 255) shl 8) or ((bytes[o+2].toInt() and 255) shl 16); return if(v and 0x800000!=0)v-0x1000000 else v }
         fun i32(o:Int)=ByteBuffer.wrap(bytes,o,4).order(ByteOrder.LITTLE_ENDIAN).int
         val gd=i32(0x0E); val ad=i32(0x1D); val md=i32(0x2C); val mo=i16(0x2A)
-        val gyro=if(gd!=0) FloatArray(3){i24(0x12+it*3)*u16(0x0C).toFloat()/gd} else null
-        val accel=if(ad!=0) FloatArray(3){i24(0x21+it*3)*u16(0x1B).toFloat()/ad} else null
+        val gyroRaw=if(gd!=0) FloatArray(3){i24(0x12+it*3)*u16(0x0C).toFloat()/gd} else null
+        val accelRaw=if(ad!=0) FloatArray(3){i24(0x21+it*3)*u16(0x1B).toFloat()/ad} else null
+        val radians=(Math.PI/180.0).toFloat()
+        val gyro=gyroRaw?.let { floatArrayOf(-it[0]*radians,it[2]*radians,it[1]*radians) }
+        val accel=accelRaw?.let { floatArrayOf(-it[0]*9.81f,it[2]*9.81f,it[1]*9.81f) }
         val magnet=if(md!=0) FloatArray(3){(i16(0x30+it*2)-mo).toFloat()/md} else null
         val timestamp=ByteBuffer.wrap(bytes,4,8).order(ByteOrder.LITTLE_ENDIAN).long
-        return SensorReading("XBX a01 HID IMU",timestamp,accel,gyro,magnet,temperature=i16(2)/326.8f+25f,rawHex=bytes.hex(length))
+        return SensorReading("XBX A01 HID IMU",timestamp/1000,accel,gyro,magnet,
+            temperature=i16(2)/326.8f+25f,rawHex=bytes.hex(length),timestampUnit="µs",
+            accelUnit="m/s²",gyroUnit="rad/s",magnetUnit="raw")
+    }
+}
+
+/** XBX/Helen FD-framed MCU responses and unsolicited hardware events. */
+class XbxMcuEventProtocol(private val interfaceId:Int):GlassesProtocol {
+    override fun startCommand():ByteArray?=null
+    override fun decode(bytes:ByteArray,length:Int):SensorReading? {
+        if(length<17 || bytes[0]!=0xfd.toByte())
+            return SensorReading("XBX auxiliary interface $interfaceId · $length bytes",rawHex=bytes.hex(length))
+        fun u16(o:Int)=(bytes[o].toInt() and 255) or ((bytes[o+1].toInt() and 255) shl 8)
+        fun i32(o:Int)=if(o+4<=length)ByteBuffer.wrap(bytes,o,4).order(ByteOrder.LITTLE_ENDIAN).int else 0
+        fun u64(o:Int)=if(o+8<=length)ByteBuffer.wrap(bytes,o,8).order(ByteOrder.LITTLE_ENDIAN).long else 0L
+        val command=u16(15);val payload=22
+        return when(command) {
+            0x6c02 -> SensorReading("XBX MCU · 镜腿温度事件",temperature=i32(payload)/1000f,rawHex=bytes.hex(length))
+            0x6c12 -> SensorReading("XBX MCU · 额头温度事件",temperature=i32(payload)/1000f,rawHex=bytes.hex(length))
+            0x6c04 -> SensorReading("XBX MCU · 接近/佩戴事件",proximity=i32(payload).toFloat(),rawHex=bytes.hex(length))
+            0x6c05 -> SensorReading("XBX MCU · 按键 type=${i32(payload)} function=${i32(payload+4)} value=${i32(payload+8)}",rawHex=bytes.hex(length))
+            0x6c07 -> SensorReading("XBX MCU · 睡眠状态 ${i32(payload)}",rawHex=bytes.hex(length))
+            0x6c0b -> SensorReading("XBX MCU · VSync sequence=${u64(payload)}",timestamp=u64(payload+8),rawHex=bytes.hex(length))
+            0x6c18 -> SensorReading("XBX MCU · 屏幕状态 ${i32(payload)}",rawHex=bytes.hex(length))
+            0x6c19 -> SensorReading("XBX MCU · 过温告警 ${i32(payload)}",rawHex=bytes.hex(length))
+            0x6c1a -> SensorReading("XBX MCU · 温漂校准 type=${i32(payload)} result=${i32(payload+4)}",rawHex=bytes.hex(length))
+            else -> SensorReading("XBX interface $interfaceId · MCU cmd=${command.hex4()}",rawHex=bytes.hex(length))
+        }
     }
 }
 

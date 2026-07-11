@@ -83,7 +83,7 @@ class UsbGlassesReader(private val context: Context, private val listener: Liste
         val protocol=when(model.protocol){ GlassesModel.Protocol.XREAL_AIR->if(model.xreal?.driverFamily?.startsWith("Helen")==true) XbxA01Protocol else XrealProtocol; GlassesModel.Protocol.XREAL_LIGHT_MCU->XrealLightMcuProtocol; GlassesModel.Protocol.XREAL_LIGHT_OV580->XrealLightOv580Protocol; GlassesModel.Protocol.ROKID->RokidProtocol; GlassesModel.Protocol.GRAWOOW_MCU,GlassesModel.Protocol.MAD_GAZE->RawUsbProtocol; GlassesModel.Protocol.VITURE_PASSIVE->VitureGen2RawProtocol; GlassesModel.Protocol.GRAWOOW_OV580->GrawoowOv580Protocol; GlassesModel.Protocol.VITURE->VitureProtocol; GlassesModel.Protocol.RAYNEO->RayneoProtocol; else->null }
         if(protocol == null){ LibusbNative.close(nativeHandle);connection.close(); return listener.onStatus("已识别接口，但该型号尚无已验证的传感器协议") }
         val nativeHelenInit=protocol===XbxA01Protocol
-        if(nativeHelenInit) listener.onReading(SensorReading(LibusbNative.initializeXrealHelen(nativeHandle)))
+        if(nativeHelenInit) listener.onReading(SensorReading(LibusbNative.startXrealHelenReceiver(nativeHandle)))
         val allInterfaces=(0 until device.interfaceCount).map { device.getInterface(it) }
         val allHid=allInterfaces.filter { it.interfaceClass == UsbConstants.USB_CLASS_HID }
         val candidates=if(model.protocol==GlassesModel.Protocol.XREAL_AIR) {
@@ -102,9 +102,10 @@ class UsbGlassesReader(private val context: Context, private val listener: Liste
         val sessions=mutableListOf<Session>()
         for(intf in candidates) {
             val input=(0 until intf.endpointCount).map{intf.getEndpoint(it)}.firstOrNull { it.direction == UsbConstants.USB_DIR_IN }
-            if(input == null || (!nativeHelenInit && LibusbNative.claim(nativeHandle,intf.id)!=0)) continue
+            val helenImu=nativeHelenInit && intf.id==model.xreal?.imuInterface
+            if(input == null || (!helenImu && LibusbNative.claim(nativeHandle,intf.id)!=0)) continue
             val output=(0 until intf.endpointCount).map{intf.getEndpoint(it)}.firstOrNull { it.direction == UsbConstants.USB_DIR_OUT }
-            sessions += Session(nativeHandle,intf,input,output,protocol,listener, passiveOnly = nativeHelenInit)
+            sessions += Session(nativeHandle,intf,input,output,protocol,listener, passiveOnly = helenImu)
         }
         if(sessions.isEmpty()){ LibusbNative.close(nativeHandle);connection.close(); listener.onStatus("未找到可读取的 HID IN 接口"); return }
         session=MultiSession(nativeHandle,connection,sessions).also { it.start() }

@@ -28,6 +28,7 @@ keystore.properties
 *.aab
 *.ap_
 captures/
+*.hprof
 
 # Local reverse-engineering artifacts and experiment notes
 experiments/

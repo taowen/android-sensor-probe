@@ -100,5 +100,9 @@ data class SensorReading(
     val temperature: Float? = null,
     val proximity: Float? = null,
     val ambientLight: Float? = null,
-    val rawHex: String = ""
+    val rawHex: String = "",
+    val timestampUnit: String = "ns",
+    val accelUnit: String = "g",
+    val gyroUnit: String = "°/s",
+    val magnetUnit: String = "raw"
 )

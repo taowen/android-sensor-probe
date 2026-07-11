@@ -24,9 +24,9 @@ usage() {
 tap_installer_loop() {
   local rounds="$1" interval="$2"
   for ((i=0; i<rounds; i++)); do
-    "$ADB" -s "$SERIAL" shell input tap "$CHECK_X" "$CHECK_Y" >/dev/null 2>&1 || true
+    "$ADB" -s "$SERIAL" shell input -d 0 tap "$CHECK_X" "$CHECK_Y" >/dev/null 2>&1 || true
     sleep 0.15
-    "$ADB" -s "$SERIAL" shell input tap "$CONTINUE_X" "$CONTINUE_Y" >/dev/null 2>&1 || true
+    "$ADB" -s "$SERIAL" shell input -d 0 tap "$CONTINUE_X" "$CONTINUE_Y" >/dev/null 2>&1 || true
     sleep "$interval"
   done
 }

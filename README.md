@@ -19,7 +19,7 @@
 详细型号和能力矩阵见 [ar-drivers-rs 支持表](docs/ar-drivers-rs-support.md)和 [VITURE 官方 SDK 支持表](docs/viture-sdk-support.md)。
 
 > [!WARNING]
-> 本项目处于实验阶段。显示模式命令会直接改变眼镜状态；只应在确认型号后使用。XBX A01 的 MCU 初始化和显示模式封包来自对官方 Beam Pro APK 的实机验证，但连续 IMU 数据仍依赖 APK 外动态注入的 `NRImuStartExt` 实现，尚未打通。
+> 本项目处于实验阶段。显示模式命令会直接改变眼镜状态；只应在确认型号后使用。XBX A01 的 MCU 初始化、SDK 版本握手和显示模式封包来自对官方 AR Launcher APK 的静态分析与实机动态验证。
 
 ## 构建
 
@@ -65,4 +65,4 @@ ADB_SERIAL=192.168.1.60:33491 scripts/install-debug.sh
 
 ## 验证状态
 
-当前实机主要验证设备为 XBX A01 (`3318:0440`)。libusb 可打开并 claim 三个 HID 接口；MCU 官方启动序列实测 6/6 条收到 ACK，55,026 字节校准配置可完整读取，IMU stop、同步和 start 也均收到 ACK。眼镜仍不主动上报 IMU 帧，当前证据指向 Beam Pro 系统组件提供、但官方 APK 内不存在的 `NRImuStartExt`。其他型号的实现来自公开协议和开源驱动移植，仍需要对应硬件逐项验证。
+当前实机主要验证设备为 XBX A01 (`3318:0440`) 和 VITURE Beast。XBX 驱动完全由应用内 JNI/libusb 实现，不依赖官方 APK、官方 SO、root 或后台 service：先初始化 MCU interface 0，发送 SDK `3.1.1` 握手，再启动 Helen interface 1 的单 URB 队列；55,026 字节校准配置可完整读取，IMU 可稳定输出已解析的加速度、角速度、磁场、温度和设备时间戳。该流程已经过手机重启后的独立冷启动验证。其他型号的实现来自官方 SDK、公开协议和开源驱动移植，仍需要对应硬件逐项验证。

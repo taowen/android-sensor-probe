@@ -35,6 +35,8 @@ class MainActivity : AppCompatActivity(), UsbGlassesReader.Listener {
     private var debugLog:BufferedWriter?=null
     private lateinit var debugLogFile:File
     @Volatile private var lastReadingUiNanos=0L
+    @Volatile private var lastReadingLogNanos=0L
+    private val latestReadings=linkedMapOf<String,String>()
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         debugLogFile=File(getExternalFilesDir(null),"sensor-probe-readings.log")
@@ -125,12 +127,20 @@ class MainActivity : AppCompatActivity(), UsbGlassesReader.Listener {
         fun vec(name:String,v:FloatArray?,unit:String) = v?.let { "$name  ${it.joinToString("  "){x->"%+.4f".format(x)}} $unit\n" } ?: ""
         val formatted=buildString {
             append("${r.source}\n")
-            val vitureRaw=r.source.startsWith("VITURE Gen2 RAW")
-            r.timestamp?.let{append("时间戳  $it ns\n")}; append(vec("加速度",r.accel,"g")); append(vec("角速度",r.gyro,if(vitureRaw)"rad/s" else "°/s")); append(vec("磁场",r.magnet,if(vitureRaw)"µT" else "raw")); append(vec("姿态 R/P/Y",r.orientation,"°"))
+            r.timestamp?.let{append("时间戳  $it ${r.timestampUnit}\n")}; append(vec("加速度",r.accel,r.accelUnit)); append(vec("角速度",r.gyro,r.gyroUnit)); append(vec("磁场",r.magnet,r.magnetUnit)); append(vec("姿态 R/P/Y",r.orientation,"°"))
             r.temperature?.let{append("温度  %.2f\n".format(it))}; r.proximity?.let{append("接近  %.3f\n".format(it))}; r.ambientLight?.let{append("环境光  %.3f\n".format(it))}; append("原始帧  ${r.rawHex}")
-        };logLine("READING ${formatted.replace('\n','|')}")
+        }
         val now=System.nanoTime()
-        if(now-lastReadingUiNanos>=50_000_000L){lastReadingUiNanos=now;runOnUiThread{this.reading.text=formatted}}
+        val highRate=r.source.contains("HID IMU") || r.source.startsWith("VITURE Gen2 RAW")
+        // XBX reports raw IMU at roughly 1 kHz. Keep transport lossless, but do
+        // not generate hundreds of MB of text or UI work per minute.
+        if(!highRate || now-lastReadingLogNanos>=20_000_000L){if(highRate)lastReadingLogNanos=now;logLine("READING ${formatted.replace('\n','|')}")}
+        synchronized(latestReadings){latestReadings[r.source.substringBefore(" · cmd=")]=formatted}
+        if(!highRate || now-lastReadingUiNanos>=50_000_000L){
+            if(highRate)lastReadingUiNanos=now
+            val all=synchronized(latestReadings){latestReadings.values.joinToString("\n────────\n")}
+            runOnUiThread{this.reading.text=all}
+        }
     }
     override fun onSlamFrame(left:android.graphics.Bitmap,right:android.graphics.Bitmap,timestamp:Long)=runOnUiThread {slamLeft.setImageBitmap(left);slamRight.setImageBitmap(right);slamStatus.text="双目 SLAM 640×480 · timestamp $timestamp µs"}
     override fun onUvcFrame(frame:android.graphics.Bitmap)=runOnUiThread {uvcPreview.visibility=View.VISIBLE;uvcPreview.setImageBitmap(frame)}

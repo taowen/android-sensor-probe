@@ -37,6 +37,8 @@ struct ProbeUsb {
     std::mutex helenMutex;
     std::condition_variable helenCondition;
     std::deque<std::vector<unsigned char>> helenQueue;
+    std::atomic<bool> helenHeartbeatRunning{false};
+    std::thread helenHeartbeatThread;
     std::atomic<bool> endpointLoopRunning{false};
     std::thread endpointThread;
     std::mutex endpointMutex;
@@ -96,20 +98,27 @@ static void LIBUSB_CALL helenTransferCallback(libusb_transfer* transfer) {
 static bool startHelenReceiver(ProbeUsb* usb) {
     usb->helenRunning = true;
     usb->helenTransfer = libusb_alloc_transfer(0);
-    if (!usb->helenTransfer) { usb->helenRunning = false; return false; }
-    libusb_fill_interrupt_transfer(usb->helenTransfer, usb->handle, 0x84, usb->helenBuffer.data(),
-                                   usb->helenBuffer.size(), helenTransferCallback, usb, 0);
-    usb->helenTransferActive = true;
-    if (libusb_submit_transfer(usb->helenTransfer) != LIBUSB_SUCCESS) {
-        usb->helenTransferActive = false;
-        libusb_free_transfer(usb->helenTransfer); usb->helenTransfer = nullptr; usb->helenRunning = false; return false;
+    if (!usb->helenTransfer) {
+        if (usb->helenTransfer) libusb_free_transfer(usb->helenTransfer);
+        usb->helenTransfer=nullptr; usb->helenRunning = false; return false;
     }
+    libusb_fill_interrupt_transfer(usb->helenTransfer, usb->handle, 0x84, usb->helenBuffer.data(),
+                                   usb->helenBuffer.size(), helenTransferCallback, usb, 5000);
+    usb->helenTransferActive = true;
     usb->helenThread = std::thread([usb] {
         while (usb->helenRunning || usb->helenTransferActive) {
             timeval timeout{0, 250000};
             libusb_handle_events_timeout_completed(usb->context, &timeout, nullptr);
         }
     });
+    const bool submitFailed=libusb_submit_transfer(usb->helenTransfer)!=LIBUSB_SUCCESS;
+    if (submitFailed) {
+        usb->helenTransferActive = false;
+        libusb_cancel_transfer(usb->helenTransfer);
+        usb->helenRunning = false;
+        if(usb->helenThread.joinable())usb->helenThread.join();
+        return false;
+    }
     return true;
 }
 
@@ -135,11 +144,15 @@ static std::vector<unsigned char> aaPacket(unsigned char command,
 }
 
 static std::vector<unsigned char> fdPacket(uint16_t command, const std::vector<unsigned char>& data,
-                                           uint32_t requestId) {
+                                           uint32_t requestId, uint32_t timestampLow = 0) {
     const uint16_t bodyLength = static_cast<uint16_t>(17 + data.size());
     std::vector<unsigned char> packet(22 + data.size());
     packet[0] = 0xfd; packet[5] = bodyLength & 0xff; packet[6] = bodyLength >> 8;
     packet[7] = requestId; packet[8] = requestId >> 8; packet[9] = requestId >> 16; packet[10] = requestId >> 24;
+    // Official Helen MCU packets carry the low 32 bits of the monotonic
+    // timestamp in the envelope as well as the full timestamp in the body.
+    packet[11] = timestampLow; packet[12] = timestampLow >> 8;
+    packet[13] = timestampLow >> 16; packet[14] = timestampLow >> 24;
     packet[15] = command; packet[16] = command >> 8;
     std::copy(data.begin(), data.end(), packet.begin() + 22);
     const uint32_t crc = crc32(packet.data() + 5, bodyLength);
@@ -232,7 +245,11 @@ Java_io_github_sensorprobe_LibusbNative_startEndpointReader(JNIEnv*, jobject, jl
     const int rc = libusb_submit_transfer(reader->transfer);
     if (rc != LIBUSB_SUCCESS) { libusb_free_transfer(reader->transfer); return rc; }
     usb->endpointReaders.emplace_back(std::move(reader));
-    if (!usb->endpointLoopRunning.exchange(true)) {
+    // Helen's permanent IMU event thread services every transfer on this
+    // libusb context, including MCU/event endpoints added after initialization.
+    if (usb->helenRunning) {
+        usb->endpointLoopRunning = true;
+    } else if (!usb->endpointLoopRunning.exchange(true)) {
         usb->endpointThread = std::thread([usb] {
             while (true) {
                 bool active=false;
@@ -268,79 +285,122 @@ Java_io_github_sensorprobe_LibusbNative_readEndpoint(JNIEnv* env, jobject, jlong
 }
 
 extern "C" JNIEXPORT jstring JNICALL
-Java_io_github_sensorprobe_LibusbNative_initializeXrealHelen(JNIEnv* env, jobject, jlong value) {
+Java_io_github_sensorprobe_LibusbNative_startXrealHelenReceiver(JNIEnv* env, jobject, jlong value) {
     auto* usb = from(value);
-    if (!usb) return env->NewStringUTF("XREAL Helen JNI 初始化：无 libusb handle");
-
-    std::array<bool, 6> mcuAck{};
-    const std::array<uint16_t, 6> mcuCommands{0x26, 0x57, 0x12, 0x02, 0x34, 0x35};
+    if (!usb) return env->NewStringUTF("XREAL Helen 被动接收：无 libusb handle");
+    int claim = LIBUSB_ERROR_BUSY;
+    bool receiver = false;
+    int heartbeat = LIBUSB_ERROR_BUSY;
+    bool heartbeatAck = false;
+    bool sdkVersionAck = false;
+    int mcuInitAcks = 0;
+    bool imuStop=false,imuLength=false,imuSync=false,imuStart=false;
+    int imuExpected=0,imuReceived=0;
+    // Official NRService initializes MCU/interface 0 completely before it
+    // claims the Helen IMU interface or submits the first endpoint 0x84 URB.
     if (libusb_kernel_driver_active(usb->handle, 0) == 1) libusb_detach_kernel_driver(usb->handle, 0);
-    const int mcuClaim = libusb_claim_interface(usb->handle, 0);
-    if (mcuClaim == LIBUSB_SUCCESS) {
-        for (size_t index = 0; index < mcuCommands.size(); ++index) {
-            std::vector<unsigned char> body;
-            if (mcuCommands[index] == 0x12 || mcuCommands[index] == 0x02) body = {1, 0, 0, 0};
-            const uint32_t requestId = 0x48454c00u + static_cast<uint32_t>(index);
-            auto packet = fdPacket(mcuCommands[index], body, requestId);
-            if (interrupt(usb->handle, 0x03, packet.data(), packet.size(), 750) != static_cast<int>(packet.size())) continue;
-            for (int attempt = 0; attempt < 8; ++attempt) {
-                std::array<unsigned char, 64> response{};
-                const int received = interrupt(usb->handle, 0x82, response.data(), response.size(), 400);
-                if (received < 23 || response[0] != 0xfd) continue;
-                const uint32_t rid = response[7] | (response[8] << 8) | (response[9] << 16) | (response[10] << 24);
-                const uint16_t command = response[15] | (response[16] << 8);
-                if (rid == requestId && command == mcuCommands[index]) {
-                    mcuAck[index] = response[22] == 0;
-                    break;
+    if (libusb_claim_interface(usb->handle, 0) == LIBUSB_SUCCESS) {
+            const std::array<uint16_t,6> commands{0x26,0x57,0x12,0x02,0x34,0x35};
+            for(size_t index=0;index<commands.size();++index){
+                std::vector<unsigned char> initBody;
+                if(commands[index]==0x12||commands[index]==0x02)initBody={1,0,0,0};
+                const uint32_t rid=static_cast<uint32_t>(index+1);
+                const uint64_t stamp=static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
+                auto initPacket=fdPacket(commands[index],initBody,rid,static_cast<uint32_t>(stamp));
+                if(interrupt(usb->handle,0x03,initPacket.data(),initPacket.size(),500)!=static_cast<int>(initPacket.size()))continue;
+                for(int attempt=0;attempt<8;++attempt){
+                    std::array<unsigned char,64> response{};
+                    const int n=interrupt(usb->handle,0x82,response.data(),response.size(),250);
+                    if(n<23||response[0]!=0xfd)continue;
+                    const uint32_t rr=response[7]|(response[8]<<8)|(response[9]<<16)|(response[10]<<24);
+                    const uint16_t rc=response[15]|(response[16]<<8);
+                    if(rr==rid&&rc==commands[index]){if(response[22]==0)++mcuInitAcks;break;}
                 }
             }
-        }
-        libusb_release_interface(usb->handle, 0);
-    }
-
-    bool stopAck = false, lengthAck = false, syncAck = false, startAck = false;
-    int expectedConfig = 0, receivedConfig = 0;
-    if (libusb_kernel_driver_active(usb->handle, 1) == 1) libusb_detach_kernel_driver(usb->handle, 1);
-    const int imuClaim = libusb_claim_interface(usb->handle, 1);
-    if (imuClaim == LIBUSB_SUCCESS) {
-        startHelenReceiver(usb);
-        auto command = [&](unsigned char id, const std::vector<unsigned char>& body = {}) {
-            std::vector<unsigned char> empty;
-            auto packet = aaPacket(id, body);
-            if (interrupt(usb->handle, 0x05, packet.data(), packet.size(), 750) != static_cast<int>(packet.size())) return empty;
-            for (int attempt = 0; attempt < 8; ++attempt) {
-                auto response = popHelen(usb, 750);
-                if (response.size() >= 8 && response[0] == 0xaa && response[7] == id) return response;
+            {
+                const uint64_t stamp=static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
+                const std::vector<unsigned char> version{'3','.','1','.','1'};
+                auto packet=fdPacket(0x31,version,7,static_cast<uint32_t>(stamp));
+                if(interrupt(usb->handle,0x03,packet.data(),packet.size(),750)==static_cast<int>(packet.size())){
+                    for(int attempt=0;attempt<8;++attempt){
+                        std::array<unsigned char,64> response{};
+                        const int n=interrupt(usb->handle,0x82,response.data(),response.size(),300);
+                        if(n<23||response[0]!=0xfd)continue;
+                        const uint32_t rr=response[7]|(response[8]<<8)|(response[9]<<16)|(response[10]<<24);
+                        const uint16_t cmd=response[15]|(response[16]<<8);
+                        if(rr==7&&cmd==0x31){sdkVersionAck=response[22]==0;break;}
+                    }
+                }
             }
-            return empty;
-        };
-
-        stopAck = !command(0x19, {0}).empty();
-        auto length = command(0x14);
-        lengthAck = length.size() >= 12;
-        if (lengthAck) expectedConfig = length[8] | (length[9] << 8) | (length[10] << 16) | (length[11] << 24);
-        while (receivedConfig < expectedConfig && receivedConfig < 128 * 1024) {
-            auto part = command(0x15);
-            if (part.size() < 8) break;
-            const int bytes = (part[5] | (part[6] << 8)) - 3;
-            if (bytes <= 0) break;
-            receivedConfig += bytes;
-        }
-        syncAck = !command(0x1a).empty();
-        startAck = !command(0x19, {1}).empty();
+            for(uint32_t rid=8;rid<=9;++rid){
+                const uint64_t now=static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
+                std::vector<unsigned char> body(8);
+                for(int i=0;i<8;++i)body[i]=static_cast<unsigned char>(now>>(i*8));
+                auto packet=fdPacket(0x001a,body,rid,static_cast<uint32_t>(now));
+                heartbeat=interrupt(usb->handle,0x03,packet.data(),packet.size(),750);
+                for(int attempt=0;attempt<8;++attempt){
+                    std::array<unsigned char,64> response{};
+                    const int n=interrupt(usb->handle,0x82,response.data(),response.size(),300);
+                    if(n<23||response[0]!=0xfd)continue;
+                    const uint32_t rr=response[7]|(response[8]<<8)|(response[9]<<16)|(response[10]<<24);
+                    const uint16_t cmd=response[15]|(response[16]<<8);
+                    if(rr==rid&&cmd==0x001a&&response[22]==0){heartbeatAck=true;break;}
+                }
+            }
+            if (libusb_kernel_driver_active(usb->handle,1)==1)libusb_detach_kernel_driver(usb->handle,1);
+            claim=libusb_claim_interface(usb->handle,1);
+            receiver=claim==LIBUSB_SUCCESS&&startHelenReceiver(usb);
+            if(receiver){
+            auto imuCommand=[&](unsigned char id,const std::vector<unsigned char>& payload=std::vector<unsigned char>{}){
+                std::vector<unsigned char> empty;
+                auto request=aaPacket(id,payload);
+                if(interrupt(usb->handle,0x05,request.data(),request.size(),750)!=static_cast<int>(request.size()))return empty;
+                for(int attempt=0;attempt<12;++attempt){
+                    auto response=popHelen(usb,500);
+                    if(response.size()>=8&&response[0]==0xaa&&response[7]==id)return response;
+                }
+                return empty;
+            };
+            imuStop=!imuCommand(0x19,{0}).empty();
+            auto length=imuCommand(0x14);
+            imuLength=length.size()>=12;
+            if(imuLength)imuExpected=length[8]|(length[9]<<8)|(length[10]<<16)|(length[11]<<24);
+            while(imuReceived<imuExpected&&imuReceived<128*1024){
+                auto part=imuCommand(0x15);if(part.size()<8)break;
+                const int bytes=(part[5]|(part[6]<<8))-3;if(bytes<=0)break;imuReceived+=bytes;
+            }
+            imuSync=!imuCommand(0x1a).empty();
+            imuStart=!imuCommand(0x19,{1}).empty();
+            usb->helenHeartbeatRunning=true;
+            usb->helenHeartbeatThread=std::thread([usb] {
+                uint32_t requestId=10;
+                while (usb->helenHeartbeatRunning) {
+                    const uint64_t stamp=static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count());
+                    std::vector<unsigned char> payload(8);
+                    for(int i=0;i<8;++i)payload[i]=static_cast<unsigned char>(stamp>>(i*8));
+                    auto heartbeatPacket=fdPacket(0x001a,payload,requestId++,static_cast<uint32_t>(stamp));
+                    interrupt(usb->handle,0x03,heartbeatPacket.data(),heartbeatPacket.size(),250);
+                    std::array<unsigned char,64> response{};
+                    interrupt(usb->handle,0x82,response.data(),response.size(),100);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+            });
+            }
     }
-
     std::ostringstream result;
-    result << "XREAL Helen JNI/libusb 官方时序 · claim MCU=" << mcuClaim << " IMU=" << imuClaim << " · MCU ";
-    for (size_t i = 0; i < mcuCommands.size(); ++i) {
-        if (i) result << ", ";
-        result << "0x" << std::hex << mcuCommands[i] << '=' << (mcuAck[i] ? "ACK" : "失败");
-    }
-    result << std::dec << " · IMU stop=" << (stopAck ? "ACK" : "失败")
-           << ", length=" << (lengthAck ? "ACK" : "失败")
-           << ", config=" << receivedConfig << '/' << expectedConfig
-           << ", sync=" << (syncAck ? "ACK" : "失败")
-           << ", start=" << (startAck ? "ACK" : "失败");
+    result << "XREAL Helen 单 URB 官方队列 · claim IMU=" << claim
+           << " · endpoint 0x84 async=" << (receiver ? "已提交" : "失败")
+           << " · MCU heartbeat=" << heartbeat << '/' << 30
+           << " ACK=" << (heartbeatAck ? "成功" : "失败")
+           << " initACK=" << mcuInitAcks << "/6"
+           << " sdk3.1.1=" << (sdkVersionAck ? "成功" : "失败")
+           << " · IMU stop=" << imuStop << " length=" << imuLength
+           << " config=" << imuReceived << '/' << imuExpected
+           << " sync=" << imuSync << " start=" << imuStart;
     return env->NewStringUTF(result.str().c_str());
 }
 
@@ -360,6 +420,8 @@ Java_io_github_sensorprobe_LibusbNative_readXrealHelen(JNIEnv* env, jobject, jlo
 extern "C" JNIEXPORT void JNICALL
 Java_io_github_sensorprobe_LibusbNative_close(JNIEnv*, jobject, jlong value) {
     auto* usb=from(value);if(!usb)return;
+    usb->helenHeartbeatRunning=false;
+    if(usb->helenHeartbeatThread.joinable())usb->helenHeartbeatThread.join();
     usb->endpointLoopRunning=false;
     for(auto& reader:usb->endpointReaders){
         reader->condition.notify_all();
